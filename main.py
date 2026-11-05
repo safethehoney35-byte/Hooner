@@ -19,9 +19,9 @@ from pydantic import BaseModel, Field, HttpUrl
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from privacy_shield import PrivacyShield
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
-SCAN_INTERVAL = 2.5
+SCAN_INTERVAL = 0.7  # lightweight DOM-version check; full scans are event-driven
 MAX_ELEMENTS = 80
 LOG_LIMIT = 240
 HOST_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
@@ -53,6 +53,8 @@ browser = None
 context = None
 page = None
 monitor_task: asyncio.Task | None = None
+last_dom_version: int | None = None
+last_full_scan_at = 0.0
 start_task: asyncio.Task | None = None
 operation_lock = asyncio.Lock()
 log = logging.getLogger("nexus")
@@ -152,6 +154,7 @@ async def route_guard(route) -> None:
 
 
 async def scan_page() -> None:
+    global last_dom_version, last_full_scan_at
     if page is None or page.is_closed():
         return
     try:
@@ -238,7 +241,7 @@ async def scan_page() -> None:
           add('Cookies / authentication / session identifiers', 'not_collected', 'Values and credentials are not read or displayed', 'Privacy');
           add('CAPTCHA / account / login history', 'not_collected', 'Account-security interactions are outside this monitor', 'Privacy');
           add('Playwright / Puppeteer / Selenium indicators', 'info', 'Only the standard WebDriver property is reported; no concealment or evasion is applied', 'Automation indicators');
-          return {controls, detections, title: document.title || '', diagnostics: {
+          return {controls, detections, title: document.title || '', dom_version: window.__nexusDomVersion || 0, diagnostics: {
             checks, user_agent: navigator.userAgent, language: navigator.language || '',
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
             viewport: `${innerWidth} × ${innerHeight}`, screen: `${screen.width} × ${screen.height}`,
@@ -285,6 +288,10 @@ async def scan_page() -> None:
             "status": "ok" if payload.get("diagnostics", {}).get("checks") else "warning",
         }
         state["last_scan"] = time.time()
+        last_full_scan_at = time.monotonic()
+        # Version is captured in the same page evaluation as the scan, so a
+        # mutation immediately after it remains detectable on the next check.
+        last_dom_version = payload.get("dom_version")
         state["title"] = payload["title"] or state["title"]
         summary = (len(result), tuple((d["name"], d["count"]) for d in raw_detections))
         if state.get("scan_summary") != summary:
@@ -295,8 +302,33 @@ async def scan_page() -> None:
 
 
 async def monitor_loop() -> None:
+    """Rescan after real DOM changes; use a slow fallback for layout-only changes."""
+    global last_dom_version
+    pending_change_at: float | None = None
     while state["status"] == "RUNNING":
-        await scan_page()
+        try:
+            if page is None or page.is_closed():
+                break
+            version = await page.evaluate("() => window.__nexusDomVersion || 0")
+            now = time.monotonic()
+            if last_dom_version is None:
+                last_dom_version = version
+            elif version != last_dom_version:
+                last_dom_version = version
+                pending_change_at = now
+            # Wait for a short quiet period so a framework's burst of DOM writes
+            # becomes one scan instead of dozens of expensive scans.
+            quiet_ready = pending_change_at is not None and now - pending_change_at >= 0.35
+            fallback_due = now - last_full_scan_at >= 8.0
+            if quiet_ready or fallback_due:
+                await scan_page()
+                pending_change_at = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            add_log(f"Continuous monitor check failed: {type(exc).__name__}: {str(exc)[:140]}", "WARN", event_type="DOM_MONITOR", status="UNCERTAIN")
+            await asyncio.sleep(1.5)
+            continue
         await asyncio.sleep(SCAN_INTERVAL)
 
 
@@ -346,6 +378,28 @@ async def start_worker(url: str, session_id: str) -> None:
         )
         await context.route("**/*", route_guard)
         page = await context.new_page()
+        # Observe meaningful DOM mutations inside the page. data-nexus-id is
+        # deliberately excluded so our own scan annotations do not retrigger it.
+        await page.add_init_script("""(() => {
+          if (window.__nexusObserverInstalled) return;
+          window.__nexusObserverInstalled = true;
+          window.__nexusDomVersion = 0;
+          const start = () => {
+            if (!document.documentElement || window.__nexusObserver) return;
+            window.__nexusObserver = new MutationObserver(records => {
+              if (records.some(r => r.type === 'childList' || r.type === 'characterData' ||
+                ['class','style','hidden','disabled','href','type','role','aria-label','aria-hidden'].includes(r.attributeName))) {
+                window.__nexusDomVersion++;
+              }
+            });
+            window.__nexusObserver.observe(document.documentElement, {
+              subtree: true, childList: true, characterData: true, attributes: true,
+              attributeFilter: ['class','style','hidden','disabled','href','type','role','aria-label','aria-hidden']
+            });
+          };
+          if (document.documentElement) start();
+          else document.addEventListener('DOMContentLoaded', start, {once:true});
+        })();""")
         page.on("pageerror", lambda exc: add_log(f"JavaScript exception: {str(exc)[:180]}", "ERROR", event_type="PAGE_JS_ERROR", status="FAILED"))
         page.on("console", lambda msg: add_log(f"Browser console error: {msg.text[:180]}", "ERROR", event_type="CONSOLE_ERROR", status="FAILED") if msg.type == "error" else None)
         page.on("requestfailed", lambda req: add_log(f"Network request failed: {urlparse(req.url).hostname or 'unknown host'} · {req.resource_type} · {req.failure or 'unknown failure'}", "WARN", event_type="NETWORK_REQUEST", status="FAILED"))
@@ -368,7 +422,8 @@ async def start_worker(url: str, session_id: str) -> None:
         if state["session_id"] != session_id or state["status"] != "STARTING":
             return
         state.update(status="RUNNING", message="Browser is running", started_at=time.time())
-        add_log(f"Page DOM loaded: {urlparse(page.url).hostname or 'website'} · title={page.title()[:100]}", event_type="PAGE_NAVIGATION", status="WORKED")
+        page_title = await page.title()
+        add_log(f"Page DOM loaded: {urlparse(page.url).hostname or 'website'} · title={page_title[:100]}", event_type="PAGE_NAVIGATION", status="WORKED")
         await scan_page()
         monitor_task = asyncio.create_task(monitor_loop())
     except asyncio.CancelledError:
@@ -430,7 +485,7 @@ async def get_data(x_nexus_key: str | None = Header(default=None)):
 
 @app.post("/api/start")
 async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None)):
-    global start_task
+    global start_task, last_dom_version, last_full_scan_at
     require_key(x_nexus_key)
     try:
         await validate_public_url(req.url)
@@ -443,6 +498,8 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
                      elements=[], detections=[], detected_elements=[],
                      diagnostics={"checks": [], "updated_at": None}, scan_summary=None,
                      started_at=None, last_scan=None, session_id=str(uuid.uuid4()))
+        last_dom_version = None
+        last_full_scan_at = 0.0
         sid = state["session_id"]
         add_log(f"Start request accepted for {urlparse(req.url).hostname or 'website'}.", event_type="START_REQUEST", status="WORKED")
         start_task = asyncio.create_task(start_worker(req.url, sid))

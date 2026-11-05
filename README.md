@@ -1,4 +1,4 @@
-# NEXUS AI Browser Monitor 1.5.0
+# NEXUS AI Browser Monitor 1.6.0
 
 A lightweight, single-session Playwright browser monitor with:
 - URL input and Start/Stop state machine
@@ -20,9 +20,10 @@ Approval is still a real browser interaction: approving a link can navigate away
 - Keep one instance: this app owns one in-memory browser session and is not multi-instance safe.
 - Use a region geographically close to your users and target sites where practical.
 - Keep dependencies lean and avoid adding large Python packages unless needed.
-- The scanner now gathers controls and page signals in one browser-side evaluation instead of many sequential Playwright calls. Its polling interval is 2.5 seconds to reduce CPU/network churn while keeping the UI responsive.
+- The scanner gathers controls and page signals in one browser-side evaluation instead of many sequential Playwright calls. A page-side `MutationObserver` flags meaningful DOM changes; NEXUS waits for a 350 ms quiet period before rescanning, so a burst of framework updates becomes one scan. A lightweight 700 ms version check notices changes, with an 8-second fallback scan for layout or visibility changes that do not produce observed mutations.
 - If target pages are heavy, their own load time dominates. `domcontentloaded` is intentionally used rather than waiting for every image and ad to finish.
-- Avoid aggressive polling or multiple browser sessions on the Free tier; Chromium memory is usually the limiting factor.
+- The UI polls backend state every 1.8 seconds; that is separate from page scanning. DOM changes trigger scans independently. The monitor covers the main page document, not the internals of cross-origin iframes.
+- Avoid multiple browser sessions on the Free tier; Chromium memory is usually the limiting factor.
 
 ## Render deployment
 
