@@ -22,6 +22,7 @@
 </header>
 <nav class="tabs" aria-label="Main navigation">
   <button class="tab active" data-tab="browserView">Browser</button>
+  <button class="tab" data-tab="detectionsView">Detections</button>
   <button class="tab" data-tab="diagnosticsView">Diagnostics</button>
   <button class="tab" data-tab="activityView">Activity & Logs</button>
 </nav>
@@ -35,25 +36,23 @@
   <section class="metrics">
     <div class="metric"><span class="metric-label">Browser state</span><strong class="metric-value" id="stateMetric">Stopped</strong><div class="metric-hint" id="stateHint">Waiting for a start request</div></div>
     <div class="metric"><span class="metric-label">Detected on page</span><strong class="metric-value" id="elementMetric">0</strong><div class="metric-hint">Unique visible controls</div></div>
-    <div class="metric"><span class="metric-label">Awaiting elements</span><strong class="metric-value" id="awaitingMetric">0</strong><div class="metric-hint">Predefined selector matches</div></div>
+    <div class="metric"><span class="metric-label">Detections</span><strong class="metric-value" id="awaitingMetric">0</strong><div class="metric-hint">Predefined selector matches</div></div>
   </section>
-  <div class="columns">
-    <section class="card">
-      <div class="card-head"><h3>Detected elements</h3><span class="count" id="elementCount">0 found</span></div>
-      <p class="hint">Controls found on the current page. Each item has its own YES / NO decision.</p>
-      <div class="element-list" id="elements"><div class="empty">Start a browser session to inspect page controls.</div></div>
-      <p class="notice">Sensitive, destructive, payment, account, and restricted ad/reward actions remain blocked. A YES approval runs an actionability check before dispatch; a timeout is never silently retried.</p>
-    </section>
-    <section class="card">
-      <div class="card-head"><h3>Awaiting elements</h3><span class="count" id="awaitingCount">0 matched</span></div>
-      <p class="hint">Your predefined selectors appear here only when a real match exists on this page.</p>
-      <div class="awaiting-list" id="awaiting"><div class="empty">No predefined elements matched yet.</div></div>
-      <p class="notice">Each unique predefined match is listed once with its own decision row. YES is enabled only for permitted interactive targets; ad/reward-flow controls and informational markers remain restricted. NO always records your decision.</p>
-    </section>
-  </div>
+  <section class="card">
+    <div class="card-head"><h3>Detected elements</h3><span class="count" id="elementCount">0 found</span></div>
+    <p class="hint">Controls found on the current page. Click YES to approve a click, NO to dismiss.</p>
+    <div class="element-list" id="elements"><div class="empty">Start a browser session to inspect page controls.</div></div>
+  </section>
   <section class="card bottom-card">
     <div class="live-head"><div><h3>Live execution</h3><div class="live-sub">Events reported by the backend and browser · not simulated</div></div><span class="count" id="eventCount">0 events</span></div>
     <div class="event-list" id="liveEvents"><div class="empty">Waiting for browser events.</div></div>
+  </section>
+</main>
+<main class="view" id="detectionsView" hidden>
+  <section class="card">
+    <div class="card-head"><h3>Predefined detections</h3><span class="count" id="awaitingCount">0 matched</span></div>
+    <p class="hint">Your configured selectors — including Watch Ads, Skip Ad, Continue and Open Here. Every visible match gets its own YES / NO row.</p>
+    <div class="awaiting-list" id="awaiting"><div class="empty">No predefined elements matched this page yet. Start a session to begin scanning.</div></div>
   </section>
 </main>
 <main class="view" id="diagnosticsView" hidden>
@@ -90,17 +89,36 @@ function setStatus(status,message=''){
 }
 function typeName(e){if(e.tag==='a')return 'Link';if(e.tag==='button')return 'Button';if(e.tag==='select')return 'Dropdown';if(e.tag==='textarea')return 'Text area';if(e.tag==='input')return ({checkbox:'Checkbox',radio:'Radio button',search:'Search field',email:'Email field',number:'Number field',url:'URL field',password:'Password field',file:'File picker',submit:'Submit button'}[e.type]||'Input field');return 'Interactive control'}
 function stateFor(id){return actionStates.get(id)||null}
+let renderedElementIds=[];
+function elementCardHTML(e,index){
+  const action=stateFor(e.id);
+  const badge=action?`<span class="element-state ${esc(action.kind)}">${esc(action.label)}</span>`
+    :e.visible?'<span class="element-state">Awaiting</span>':'<span class="element-state">Hidden</span>';
+  const controls=e.visible
+    ?`<div class="element-actions"><button class="yes" data-approve="${esc(e.id)}">YES</button><button class="no" data-reject="${esc(e.id)}">NO</button></div>`
+    :`<div class="element-actions"><span class="blocked">Not visible</span></div>`;
+  return `<article class="element-card" data-eid="${esc(e.id)}"><div class="element-main"><span class="number">${index+1}</span><div class="element-copy"><div class="element-name">${esc(e.text||typeName(e))}</div><div class="element-meta">${esc(typeName(e))}${e.href?' · '+esc(e.href):''}</div></div>${badge}</div>${controls}</article>`;
+}
 function renderElements(items){
   $('elementCount').textContent=`${items.length} found`;$('elementMetric').textContent=items.length;
-  if(!items.length){$('elements').innerHTML='<div class="empty">No supported controls detected on this page.</div>';return}
-  $('elements').innerHTML=items.map((e,index)=>{
-    const action=stateFor(e.id);let badge=e.clickable?'<span class="element-state">Awaiting review</span>':`<span class="element-state">${e.sensitive?'Blocked':e.visible?'Read only':'Hidden'}</span>`;
-    if(action)badge=`<span class="element-state ${esc(action.kind)}">${esc(action.label)}</span>`;
-    const controls=e.clickable?`<div class="element-actions"><button class="yes" data-approve="${esc(e.id)}">YES · Review</button><button class="no" data-reject="${esc(e.id)}">NO</button></div>`:`<div class="element-actions"><span class="blocked">${e.sensitive?'Blocked by safety rules':e.visible?'Not eligible for approval':'Not visible on page'}</span></div>`;
-    return `<article class="element-card"><div class="element-main"><span class="number">${index+1}</span><div class="element-copy"><div class="element-name">${esc(e.text||typeName(e))}</div><div class="element-meta">${esc(typeName(e))}${e.href?' · '+esc(e.href):''}</div></div>${badge}</div>${controls}</article>`;
-  }).join('');
-  document.querySelectorAll('[data-approve]').forEach(b=>b.addEventListener('click',()=>openApproval(b.dataset.approve)));
-  document.querySelectorAll('[data-reject]').forEach(b=>b.addEventListener('click',()=>rejectElement(b.dataset.reject)));
+  if(!items.length){$('elements').innerHTML='<div class="empty">No controls detected on this page.</div>';renderedElementIds=[];return}
+  const newIds=items.map(e=>e.id);
+  const same=newIds.length===renderedElementIds.length&&newIds.every((id,i)=>id===renderedElementIds[i]);
+  if(!same){
+    $('elements').innerHTML=items.map((e,i)=>elementCardHTML(e,i)).join('');
+    renderedElementIds=newIds;
+    document.querySelectorAll('#elements [data-approve]').forEach(b=>b.addEventListener('click',()=>openApproval(b.dataset.approve)));
+    document.querySelectorAll('#elements [data-reject]').forEach(b=>b.addEventListener('click',()=>rejectElement(b.dataset.reject)));
+  } else {
+    // only update badges for changed action states, don't touch DOM otherwise
+    items.forEach(e=>{
+      const card=document.querySelector(`#elements [data-eid="${CSS.escape(e.id)}"]`);
+      if(!card)return;
+      const action=stateFor(e.id);
+      const badge=card.querySelector('.element-state');
+      if(badge&&action){const want=action.label;if(badge.textContent!==want){badge.textContent=want;badge.className=`element-state ${action.kind}`}}
+    });
+  }
 }
 function renderAwaiting(items){
   const matches=(items||[]).filter(e=>e.visible);
@@ -110,13 +128,8 @@ function renderAwaiting(items){
     const names=(e.detection_names||[]).map(n=>friendlyNames[n]||n);
     const title=names.join(' · ')||'Predefined match';
     const action=stateFor(e.id);
-    const status=action?`<span class="element-state ${esc(action.kind)}">${esc(action.label)}</span>`:
-      `<span class="element-state">${e.approval_allowed?'Awaiting review':'Restricted / signal'}</span>`;
-    const yes=e.approval_allowed
-      ? `<button class="yes" data-approve="${esc(e.id)}">YES · Review</button>`
-      : `<button class="yes" disabled title="${esc(e.approval_reason||'This predefined signal cannot be clicked.')}">YES · Unavailable</button>`;
-    const no=`<button class="no" data-reject="${esc(e.id)}">NO</button>`;
-    return `<article class="awaiting-card"><div class="element-main"><span class="number">${index+1}</span><div class="element-copy"><div class="awaiting-title">${esc(title)}</div><div class="awaiting-meta">${esc(e.text||e.tag||'Matched element')} · ${esc(typeName(e))}</div>${e.href?`<div class="awaiting-meta">${esc(e.href)}</div>`:''}</div><div class="awaiting-right">${status}</div></div><div class="element-actions">${yes}${no}</div><div class="awaiting-meta">${esc(e.approval_allowed?'Matched configured selector. Review is individual to this DOM element.':(e.approval_reason||'This match is for observation only.'))}</div></article>`;
+    const badge=action?`<span class="element-state ${esc(action.kind)}">${esc(action.label)}</span>`:'<span class="element-state">Awaiting</span>';
+    return `<article class="awaiting-card"><div class="element-main"><span class="number">${index+1}</span><div class="element-copy"><div class="awaiting-title">${esc(title)}</div><div class="awaiting-meta">${esc(e.text||e.tag||'Matched element')} · ${esc(typeName(e))}</div>${e.href?`<div class="awaiting-meta">${esc(e.href)}</div>`:''}</div><div class="awaiting-right">${badge}</div></div><div class="element-actions"><button class="yes" data-approve="${esc(e.id)}">YES</button><button class="no" data-reject="${esc(e.id)}">NO</button></div></article>`;
   }).join('');
   document.querySelectorAll('#awaiting [data-approve]').forEach(b=>b.addEventListener('click',()=>openApproval(b.dataset.approve)));
   document.querySelectorAll('#awaiting [data-reject]').forEach(b=>b.addEventListener('click',()=>rejectElement(b.dataset.reject)));
@@ -132,7 +145,7 @@ function renderDiagnostics(d){const checks=d?.checks||[];const filter=$('diagFil
 function renderLogs(id,items,empty){$(id).innerHTML=items?.length?items.slice().reverse().map(x=>`<div class="log ${x.level==='ERROR'||x.status==='FAILED'?'ERROR':''}"><time>${esc(x.time||'')} · ${esc(x.id||'')} · ${esc(x.event_type||x.level||'EVENT')}</time>${esc(x.message||'')}</div>`).join(''):`<div class="empty">${empty}</div>`}
 function renderAll(d){lastData=d;setStatus(d.status,d.status==='ERROR'?d.message:'');renderElements(d.elements||[]);renderAwaiting(d.detected_elements||[]);renderDiagnostics(d.diagnostics||{});renderLogs('activity',d.activity||[],'No activity yet.');renderLogs('errors',d.errors||[],'No errors recorded.');renderEvents(d.events||d.activity||[])}
 async function refresh(){if(!key||pollBusy)return;pollBusy=true;try{const d=await api('/api/data');renderAll(d);$('topError').textContent=''}catch(e){if(e.message.includes('Access key')){$('keyModal').classList.add('show')}else if(e.message.includes('not configured')){$('topError').textContent=e.message;setStatus('ERROR',e.message)}else{$('topError').textContent=e.message}}finally{pollBusy=false}}
-function openApproval(id){const e=[...(lastData?.elements||[]),...(lastData?.detected_elements||[])].find(x=>x.id===id);if(!e)return;if(e.approval_allowed===false){$('topError').textContent=e.approval_reason||'This predefined match is not an allowed click target.';return}pending=id;$('approvalTitle').textContent='Confirm this action';$('approvalText').textContent=`${e.text} · ${typeName(e)}. NEXUS will re-check this exact element before sending the click.`;$('approvalError').textContent='';$('approvalModal').classList.add('show')}
+function openApproval(id){const e=[...(lastData?.elements||[]),...(lastData?.detected_elements||[])].find(x=>x.id===id);if(!e)return;pending=id;$('approvalTitle').textContent='Confirm click';$('approvalText').textContent=`${e.text||typeName(e)} · ${typeName(e)}`;$('approvalError').textContent='';$('approvalModal').classList.add('show')}
 function closeApproval(){$('approvalModal').classList.remove('show');pending=null}
 async function rejectElement(id){try{const result=await api('/api/reject',{method:'POST',body:JSON.stringify({element_id:id})});actionStates.set(id,{kind:'rejected',label:'Declined'});await refresh()}catch(e){$('topError').textContent=`Could not record NO decision: ${e.message}`}}
 $('cancelApproval').onclick=closeApproval;
