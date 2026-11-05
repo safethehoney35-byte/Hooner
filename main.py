@@ -4,7 +4,6 @@ import asyncio
 import ipaddress
 import logging
 import os
-import re
 import socket
 import time
 import uuid
@@ -13,107 +12,44 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, HttpUrl
-from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+from pydantic import BaseModel, Field
+from playwright.async_api import async_playwright, Error as PlaywrightError
 from privacy_shield import PrivacyShield
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "2.0.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
-SCAN_INTERVAL = 0.7  # lightweight DOM-version check; full scans are event-driven
-MAX_ELEMENTS = 80
+MAX_ACTIONS = 5000
 LOG_LIMIT = 240
 HOST_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
 
-DETECTION_ONLY = {
-    "watchAds": '[data-testid="lv-membership-plan-option-wrapper-btn"]',
-    "continueButton": '[data-testid="action-wall-continue-action-btn"]',
-    "adCounter": ".carousel-items-counter p",
-    "adLabel": ".lv-card__ad-indicator p",
-    "skipAdContainer": '[data-testid="lv-lib-carousel-skip-btn"]',
-    "successHeading": '[data-testid="success-title"]',
-    "contentReady": ".success-wrapper h2",
-    "openHereButton": ".success-wrapper button",
-}
-SAFE_INPUT_TYPES = {"", "button", "checkbox", "color", "date", "datetime-local", "email", "month", "number", "radio", "range", "search", "tel", "text", "time", "url", "week"}
-
 state: dict[str, Any] = {
     "status": "STOPPED", "url": "", "title": "", "message": "Ready",
-    "started_at": None, "last_scan": None, "elements": [],
-    "detections": [], "detected_elements": [],
-    "diagnostics": {"checks": [], "updated_at": None}, "activity": [], "errors": [], "events": [], "session_id": None,
+    "started_at": None, "actions_total": 0, "actions_done": 0,
+    "success": 0, "failed": 0, "current_action": None,
+    "diagnostics": {}, "activity": [], "errors": [], "events": [],
+    "session_id": None, "replay_running": False,
 }
-playwright = None
-browser = None
-context = None
-page = None
-monitor_task: asyncio.Task | None = None
-last_dom_version: int | None = None
-last_full_scan_at = 0.0
+playwright = browser = context = page = None
+replay_task: asyncio.Task | None = None
 start_task: asyncio.Task | None = None
 operation_lock = asyncio.Lock()
-approval_lock = asyncio.Lock()
+stop_event = asyncio.Event()
 log = logging.getLogger("nexus")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
-def add_log(message: str, level: str = "INFO", *, event_type: str = "LOG", status: str = "INFO", event_id: str | None = None) -> dict[str, Any]:
-    """Record one real server/browser event for the UI and Render logs."""
-    event_id = event_id or uuid.uuid4().hex[:10].upper()
-    item = {
-        "id": event_id,
-        "time": time.strftime("%H:%M:%S"),
-        "timestamp": time.time(),
-        "level": level,
-        "event_type": event_type,
-        "status": status,
-        "message": str(message)[:500],
-    }
-    state["activity"].append(item)
-    state["activity"] = state["activity"][-LOG_LIMIT:]
-    state["events"].append(item)
-    state["events"] = state["events"][-LOG_LIMIT:]
+def add_log(message: str, level: str = "INFO", *, event_type: str = "LOG", status: str = "INFO") -> None:
+    item = {"id": uuid.uuid4().hex[:10].upper(), "time": time.strftime("%H:%M:%S"),
+            "timestamp": time.time(), "level": level, "event_type": event_type,
+            "status": status, "message": str(message)[:500]}
+    state["activity"].append(item); state["activity"] = state["activity"][-LOG_LIMIT:]
+    state["events"].append(item); state["events"] = state["events"][-LOG_LIMIT:]
     if level == "ERROR" or status == "FAILED":
-        state["errors"].append(item)
-        state["errors"] = state["errors"][-LOG_LIMIT:]
-    log_method = log.error if level == "ERROR" or status == "FAILED" else log.warning if level == "WARN" else log.info
-    log_method("event_id=%s event=%s status=%s %s", event_id, event_type, status, message)
-    return item
-
-
-def playwright_error_detail(exc: Exception, limit: int = 1100) -> str:
-    """Preserve Playwright's actionable call log instead of logging only its first line."""
-    raw = str(exc) or type(exc).__name__
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    useful = [line for line in lines if any(token in line.lower() for token in (
-        "waiting for", "locator resolved", "intercepts pointer", "not visible", "not enabled",
-        "not stable", "scroll", "element is", "retrying", "call log", "timeout"
-    ))]
-    detail = " | ".join(useful[-8:] if useful else lines[-6:])
-    return detail[:limit]
-
-
-async def inspect_click_target(locator) -> str:
-    """Return a compact live DOM hit-test explanation without interacting with the page."""
-    try:
-        info = await asyncio.wait_for(locator.evaluate("""el => {
-          const r = el.getBoundingClientRect();
-          const x = Math.max(0, Math.min(innerWidth - 1, r.left + r.width / 2));
-          const y = Math.max(0, Math.min(innerHeight - 1, r.top + r.height / 2));
-          const top = document.elementFromPoint(x, y);
-          const style = getComputedStyle(el);
-          return {
-            rect: `${Math.round(r.width)}x${Math.round(r.height)} at ${Math.round(r.left)},${Math.round(r.top)}`,
-            display: style.display, visibility: style.visibility, pointerEvents: style.pointerEvents,
-            disabled: !!el.disabled,
-            hitTarget: top ? `${top.tagName.toLowerCase()}${top.id ? '#' + top.id : ''}` : 'none',
-            covered: !!(top && top !== el && !el.contains(top))
-          };
-        }"""), timeout=1.5)
-        return "Live target: " + "; ".join(f"{k}={v}" for k, v in info.items())
-    except Exception as exc:
-        return f"Live target inspection unavailable: {type(exc).__name__}."
+        state["errors"].append(item); state["errors"] = state["errors"][-LOG_LIMIT:]
+    (log.error if level == "ERROR" or status == "FAILED" else log.warning if level == "WARN" else log.info)(
+        "event_id=%s event=%s status=%s %s", item["id"], event_type, status, message)
 
 
 def require_key(x_nexus_key: str | None) -> None:
@@ -132,387 +68,258 @@ async def validate_public_url(value: str) -> str:
             raise ValueError("URLs containing embedded credentials are not allowed.")
         host = parsed.hostname.rstrip(".").lower()
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        cache_key = f"{host}:{port}"
-        cached = HOST_VALIDATION_CACHE.get(cache_key)
+        cached = HOST_VALIDATION_CACHE.get(f"{host}:{port}")
         if cached and time.monotonic() - cached[0] < 60:
-            if cached[1]:
-                return value
+            if cached[1]: return value
             raise ValueError("The URL resolves to a private or non-public address.")
         if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
             raise ValueError("Local/private network addresses are not allowed.")
         try:
-            ip = ipaddress.ip_address(host)
-            addresses = [ip]
+            addresses = [ipaddress.ip_address(host)]
         except ValueError:
-            infos = await asyncio.wait_for(
-                asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
-                timeout=4.0,
-            )
-            addresses = [ipaddress.ip_address(info[4][0]) for info in infos]
-        if not addresses:
-            raise ValueError("The hostname did not resolve.")
-        is_public = all(addr.is_global for addr in addresses)
-        HOST_VALIDATION_CACHE[cache_key] = (time.monotonic(), is_public)
-        if not is_public:
-            raise ValueError("The URL resolves to a private or non-public address.")
+            infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM), 4)
+            addresses = [ipaddress.ip_address(x[4][0]) for x in infos]
+        public = bool(addresses) and all(x.is_global for x in addresses)
+        HOST_VALIDATION_CACHE[f"{host}:{port}"] = (time.monotonic(), public)
+        if not public: raise ValueError("The URL resolves to a private or non-public address.")
         return value
     except asyncio.TimeoutError:
-        raise ValueError("DNS lookup timed out. Check the hostname and try again.")
+        raise ValueError("DNS lookup timed out.")
     except (socket.gaierror, OSError):
         raise ValueError("The hostname could not be resolved.")
     except ValueError:
         raise
-    except Exception as exc:
-        raise ValueError(f"URL validation failed: {type(exc).__name__}")
 
 
-# All Chromium network requests pass through this policy layer before continuing.
 TRACKER_BLOCKING = os.getenv("NEXUS_BLOCK_TRACKERS", "true").strip().lower() not in {"0", "false", "no", "off"}
-_EXTRA_TRACKERS = {x.strip().lower() for x in os.getenv("NEXUS_EXTRA_TRACKERS", "").split(",") if x.strip()}
 privacy_shield = PrivacyShield(validate_public_url, block_trackers=TRACKER_BLOCKING,
-                               extra_tracker_domains=_EXTRA_TRACKERS)
+    extra_tracker_domains={x.strip().lower() for x in os.getenv("NEXUS_EXTRA_TRACKERS", "").split(",") if x.strip()})
 
 
 async def route_guard(route) -> None:
-    request = route.request
-    allowed, reason = await privacy_shield.inspect(request.url, request.resource_type)
+    allowed, reason = await privacy_shield.inspect(route.request.url, route.request.resource_type)
     if allowed:
         await route.continue_()
     else:
-        host = urlparse(request.url).hostname or "unknown"
-        add_log(f"Privacy Shield blocked {host} ({reason}).", "WARN")
+        add_log(f"Privacy Shield blocked {urlparse(route.request.url).hostname or 'unknown'} ({reason}).",
+                "WARN", event_type="NETWORK_REQUEST", status="BLOCKED")
         await route.abort()
 
 
-async def scan_page() -> None:
-    global last_dom_version, last_full_scan_at
-    if page is None or page.is_closed():
-        return
-    try:
-        # Collect controls and diagnostic signals in one browser-side pass to
-        # avoid a series of slow Playwright round trips.
-        payload = await page.evaluate("""({limit, selectors}) => {
-          const nodes = [...document.querySelectorAll(
-            'button, a[href], input:not([type=hidden]), select, textarea, [role="button"]'
-          )].slice(0, limit);
-          const controls = nodes.map((el, index) => {
-            if (!el.dataset.nexusId) el.dataset.nexusId = 'nx-' + crypto.randomUUID();
-            const style = getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            const visible = style.display !== 'none' && style.visibility !== 'hidden'
-              && rect.width > 0 && rect.height > 0;
-            const tag = el.tagName.toLowerCase();
-            const type = (el.getAttribute('type') || '').toLowerCase();
-            const raw = (el.innerText || el.value || el.getAttribute('aria-label')
-              || el.getAttribute('title') || el.getAttribute('placeholder') || '').trim();
-            const text = raw.replace(/\\s+/g, ' ').slice(0, 150);
-            const fallback = ({button:'Button', a:'Link', input:({checkbox:'Checkbox',radio:'Radio button',submit:'Submit button',reset:'Reset button',file:'File picker',search:'Search field',email:'Email field',number:'Number field',url:'URL field',password:'Password field',button:'Button','':'Input field'}[type] || 'Input field'), select:'Dropdown', textarea:'Text area'})[tag] || 'Interactive control';
-            return {
-              id: el.dataset.nexusId, tag, text: text || `${fallback} ${index + 1}`,
-              type, href: tag === 'a' ? (() => { try { const u = new URL(el.href); u.search = ''; u.hash = ''; return u.href; } catch (_) { return ''; } })() : '', visible, disabled: !!el.disabled,
-              aria: el.getAttribute('aria-label') || '', role: el.getAttribute('role') || ''
-            };
-          });
-          const detections = selectors.map(({name, selector}) => {
-            try {
-              let matches = [...document.querySelectorAll(selector)];
-              // The Linkvertise wrapper selector is shared by membership plans
-              // and the actual ad card. Keep only the visible card explicitly
-              // labelled "Watch Ads" for this detection; leave other selectors
-              // and all approval restrictions unchanged.
-              if (name === 'watchAds') {
-                matches = matches.filter(el => {
-                  const rect = el.getBoundingClientRect();
-                  const style = getComputedStyle(el);
-                  const visible = style.display !== 'none'
-                    && style.visibility !== 'hidden'
-                    && rect.width > 0 && rect.height > 0;
-                  const text = (el.innerText || el.textContent || '')
-                    .trim().replace(/\\s+/g, ' ');
-                  return visible && /\\bwatch\\s+ads\\b/i.test(text);
-                });
-              }
-              const elements = matches.map(el => {
-                if (!el.dataset.nexusId) el.dataset.nexusId = 'nx-' + crypto.randomUUID();
-                const rect = el.getBoundingClientRect();
-                const style = getComputedStyle(el);
-                const visible = style.display !== 'none' && style.visibility !== 'hidden'
-                  && rect.width > 0 && rect.height > 0;
-                const tag = el.tagName.toLowerCase();
-                const type = (el.getAttribute('type') || '').toLowerCase();
-                const aria = el.getAttribute('aria-label') || '';
-                const role = el.getAttribute('role') || '';
-                const rawHref = tag === 'a' ? el.href : '';
-                const href = (() => { try { const u = new URL(rawHref); u.search = ''; u.hash = ''; return u.href; } catch (_) { return ''; } })();
-                const text = (el.innerText || el.value || aria || el.getAttribute('title') || '')
-                  .trim().replace(/\\s+/g, ' ').slice(0, 150);
-                return {id: el.dataset.nexusId, text: text || tag, tag, type, href, aria, role, visible, disabled: !!el.disabled};
-              });
-              const sample = elements.length ? elements[0].text : '';
-              return {name, selector, count: matches.length, sample, detection_only: true, elements};
-            } catch (_) { return {name, selector, count: 0, sample: '', detection_only: true, elements: []}; }
-          });
-          const nav = performance.getEntriesByType('navigation')[0] || null;
-          const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
-          const checks = [];
-          const add = (name, status, detail, group) => checks.push({name, status, detail: String(detail ?? '').slice(0,180), group});
-          const yesNo = (value) => value ? 'available' : 'unavailable';
-          add('JavaScript', 'ok', 'Enabled in the monitored page', 'Runtime');
-          add('Cookies', navigator.cookieEnabled ? 'ok' : 'warning', yesNo(navigator.cookieEnabled), 'Storage');
-          let localStorageState = 'available', sessionStorageState = 'available';
-          try { localStorage.setItem('__nexus_diag__','1'); localStorage.removeItem('__nexus_diag__'); } catch (_) { localStorageState = 'blocked'; }
-          try { sessionStorage.setItem('__nexus_diag__','1'); sessionStorage.removeItem('__nexus_diag__'); } catch (_) { sessionStorageState = 'blocked'; }
-          add('Local storage', localStorageState === 'available' ? 'ok' : 'warning', localStorageState, 'Storage');
-          add('Session storage', sessionStorageState === 'available' ? 'ok' : 'warning', sessionStorageState, 'Storage');
-          add('Browser / engine', 'ok', `${navigator.userAgentData?.brands?.map(x=>x.brand).join(', ') || navigator.userAgent} · engine details vary by browser`, 'Environment');
-          add('Operating system hint', 'ok', navigator.userAgentData?.platform || navigator.platform || 'Not exposed', 'Environment');
-          add('Language', 'ok', navigator.language || 'Not exposed', 'Environment');
-          add('Timezone', 'ok', Intl.DateTimeFormat().resolvedOptions().timeZone || 'Not exposed', 'Environment');
-          add('Viewport', 'ok', `${innerWidth} × ${innerHeight} CSS px; screen ${screen.width} × ${screen.height}; DPR ${devicePixelRatio}`, 'Environment');
-          add('Touch support', 'info', `${navigator.maxTouchPoints || 0} touch points`, 'Input');
-          add('Pointer capabilities', 'info', matchMedia('(pointer: fine)').matches ? 'Fine pointer available' : (matchMedia('(pointer: coarse)').matches ? 'Coarse pointer available' : 'No primary pointer reported'), 'Input');
-          add('Hardware concurrency', 'info', navigator.hardwareConcurrency ? `${navigator.hardwareConcurrency} logical cores reported` : 'Not exposed', 'Environment');
-          add('Device memory', 'info', navigator.deviceMemory ? `${navigator.deviceMemory} GB reported` : 'Not exposed', 'Environment');
-          add('WebDriver indicator', navigator.webdriver === true ? 'warning' : 'info', `navigator.webdriver = ${String(navigator.webdriver)}`, 'Automation indicators');
-          add('WebGL API', typeof WebGLRenderingContext !== 'undefined' ? 'ok' : 'warning', yesNo(typeof WebGLRenderingContext !== 'undefined'), 'Graphics');
-          add('WebRTC API', typeof RTCPeerConnection !== 'undefined' ? 'ok' : 'warning', yesNo(typeof RTCPeerConnection !== 'undefined'), 'Media');
-          add('Media devices API', navigator.mediaDevices ? 'ok' : 'info', yesNo(!!navigator.mediaDevices), 'Media');
-          add('Clipboard API', navigator.clipboard ? 'ok' : 'info', yesNo(!!navigator.clipboard), 'Permissions');
-          add('Geolocation API', navigator.geolocation ? 'ok' : 'info', yesNo(!!navigator.geolocation), 'Permissions');
-          add('Notification permission', 'info', typeof Notification !== 'undefined' ? Notification.permission : 'API unavailable', 'Permissions');
-          add('Network information', conn ? 'info' : 'unsupported', conn ? `${conn.effectiveType || 'type unknown'}; RTT ${conn.rtt ?? 'unknown'} ms` : 'Browser does not expose Network Information API', 'Network');
-          add('Navigation timing', nav ? 'ok' : 'warning', nav ? `DOM content loaded ${Math.round(nav.domContentLoadedEventEnd)} ms; load ${Math.round(nav.loadEventEnd)} ms` : 'Navigation timing unavailable', 'Performance');
-          const resources = performance.getEntriesByType('resource');
-          add('Resource loading', 'ok', `${resources.length} resources; ${Math.round(resources.reduce((n,r)=>n+(r.transferSize||0),0)/1024)} KB transferred where exposed`, 'Performance');
-          add('Page visibility', 'info', document.visibilityState, 'Behaviour');
-          add('Referrer', 'info', document.referrer ? new URL(document.referrer).origin : 'No referrer', 'Navigation');
-          add('JavaScript errors', 'info', 'Page-level JavaScript exceptions are captured in the Error log', 'Runtime');
-          add('IP address / ISP / location', 'unsupported', 'Not collected: browser page scripts cannot reliably expose these values', 'Network');
-          add('TLS fingerprint / HTTP protocol fingerprint', 'unsupported', 'Not exposed to page JavaScript; not inferred or spoofed', 'Network');
-          add('Canvas / audio / installed-font fingerprints', 'not_collected', 'Intentionally not collected; these can create cross-site device fingerprints', 'Privacy');
-          add('Cookies / authentication / session identifiers', 'not_collected', 'Values and credentials are not read or displayed', 'Privacy');
-          add('CAPTCHA / account / login history', 'not_collected', 'Account-security interactions are outside this monitor', 'Privacy');
-          add('Playwright / Puppeteer / Selenium indicators', 'info', 'Only the standard WebDriver property is reported; no concealment or evasion is applied', 'Automation indicators');
-          return {controls, detections, title: document.title || '', dom_version: window.__nexusDomVersion || 0, diagnostics: {
-            checks, user_agent: navigator.userAgent, language: navigator.language || '',
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-            viewport: `${innerWidth} × ${innerHeight}`, screen: `${screen.width} × ${screen.height}`,
-            dpr: devicePixelRatio, resource_count: resources.length,
-            navigation_ms: nav ? Math.round(nav.domContentLoadedEventEnd) : null
-          }};
-        }""", {"limit": MAX_ELEMENTS, "selectors": [{"name": name, "selector": selector} for name, selector in DETECTION_ONLY.items()]})
-        result = payload["controls"]
-        for item in result:
-            item["sensitive"] = False
-            item["clickable"] = item["visible"] and not item["disabled"]
-        raw_detections = payload["detections"]
-        signal_ids = {el["id"] for det in raw_detections for el in det.get("elements", [])}
-        # Keep predefined selector matches out of the general list. They appear
-        # once, by friendly selector name, in the separate Awaiting Elements panel.
-        result = [item for item in result if item["id"] not in signal_ids]
-        state["elements"] = result
-        # Flatten configured selector matches by DOM id. The UI can show one
-        # decision row per unique match; server-side policy still decides whether
-        # a match is eligible for any interaction.
-        detected_by_id: dict[str, dict] = {}
-        for det in raw_detections:
-            unique_elements = []
-            seen_in_group: set[str] = set()
-            for el in det.get("elements", []):
-                if el["id"] in seen_in_group:
-                    continue
-                seen_in_group.add(el["id"])
-                unique_elements.append(el)
-                entry = detected_by_id.setdefault(el["id"], {**el, "detection_names": []})
-                if det["name"] not in entry["detection_names"]:
-                    entry["detection_names"].append(det["name"])
-            det["elements"] = unique_elements
-            det["count"] = len(unique_elements)
-
-        for entry in detected_by_id.values():
-            entry["sensitive"] = False
-            entry["clickable"] = bool(entry.get("visible") and not entry.get("disabled"))
-            entry["approval_allowed"] = True
-            entry["approval_reason"] = "Eligible for approval."
-
-        # Copy the flattened, deduplicated approval metadata back into each
-        # selector group so the UI can render one row per actual DOM element.
-        for det in raw_detections:
-            for el in det.get("elements", []):
-                merged = detected_by_id.get(el["id"], {})
-                for key in ("type", "href", "aria", "role", "sensitive", "clickable", "approval_allowed", "approval_reason", "detection_names"):
-                    if key in merged:
-                        el[key] = merged[key]
-        state["detections"] = raw_detections
-        state["detected_elements"] = list(detected_by_id.values())
-        state["diagnostics"] = {
-            **payload.get("diagnostics", {}),
-            "updated_at": time.time(),
-            "status": "ok" if payload.get("diagnostics", {}).get("checks") else "warning",
-        }
-        state["last_scan"] = time.time()
-        last_full_scan_at = time.monotonic()
-        # Version is captured in the same page evaluation as the scan, so a
-        # mutation immediately after it remains detectable on the next check.
-        last_dom_version = payload.get("dom_version")
-        state["title"] = payload["title"] or state["title"]
-        summary = (len(result), tuple((d["name"], d["count"]) for d in raw_detections))
-        if state.get("scan_summary") != summary:
-            state["scan_summary"] = summary
-            add_log(f"Page scan updated: {len(result)} unique controls; {sum(d['count'] for d in raw_detections)} predefined matches.", event_type="PAGE_SCAN", status="WORKED")
-    except Exception as exc:
-        add_log(f"DOM scan failed: {type(exc).__name__}: {str(exc)[:180]}", "ERROR", event_type="PAGE_SCAN", status="FAILED")
-
-
-async def monitor_loop() -> None:
-    """Rescan after real DOM changes; use a slow fallback for layout-only changes."""
-    global last_dom_version
-    pending_change_at: float | None = None
-    while state["status"] == "RUNNING":
-        try:
-            if page is None or page.is_closed():
-                break
-            version = await page.evaluate("() => window.__nexusDomVersion || 0")
-            now = time.monotonic()
-            if last_dom_version is None:
-                last_dom_version = version
-            elif version != last_dom_version:
-                last_dom_version = version
-                pending_change_at = now
-            # Wait for a short quiet period so a framework's burst of DOM writes
-            # becomes one scan instead of dozens of expensive scans.
-            quiet_ready = pending_change_at is not None and now - pending_change_at >= 0.35
-            fallback_due = now - last_full_scan_at >= 8.0
-            if quiet_ready or fallback_due:
-                await scan_page()
-                pending_change_at = None
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            add_log(f"Continuous monitor check failed: {type(exc).__name__}: {str(exc)[:140]}", "WARN", event_type="DOM_MONITOR", status="UNCERTAIN")
-            await asyncio.sleep(1.5)
-            continue
-        await asyncio.sleep(SCAN_INTERVAL)
+async def browser_diagnostics() -> dict[str, Any]:
+    if page is None or page.is_closed(): return {}
+    data = await page.evaluate("""() => {
+      const nav=performance.getEntriesByType('navigation')[0]||null;
+      const resources=performance.getEntriesByType('resource');
+      const checks=[];
+      const add=(name,status,detail)=>checks.push({name,status,detail:String(detail)});
+      add('JavaScript','ok','Enabled');
+      add('Cookies',navigator.cookieEnabled?'ok':'warning',navigator.cookieEnabled?'Available':'Disabled');
+      add('Browser', 'ok', navigator.userAgent);
+      add('Language','info',navigator.language||'Unknown');
+      add('Timezone','info',Intl.DateTimeFormat().resolvedOptions().timeZone||'Unknown');
+      add('Viewport','info',innerWidth+' × '+innerHeight);
+      add('Page visibility','info',document.visibilityState);
+      add('Navigation timing',nav?'ok':'warning',nav?Math.round(nav.domContentLoadedEventEnd)+' ms DOM ready':'Not available');
+      add('Resource loading','ok',resources.length+' resources observed');
+      add('Page JavaScript errors','info','Captured in activity/error logs');
+      return {title:document.title||'',checks,resource_count:resources.length,
+        navigation_ms:nav?Math.round(nav.domContentLoadedEventEnd):null,
+        user_agent:navigator.userAgent,language:navigator.language||'',
+        timezone:Intl.DateTimeFormat().resolvedOptions().timeZone||''};
+    }""")
+    data["updated_at"] = time.time()
+    return data
 
 
 async def cleanup_browser() -> None:
-    global playwright, browser, context, page, monitor_task
-    current_monitor = monitor_task
-    monitor_task = None
-    if current_monitor and current_monitor is not asyncio.current_task():
-        current_monitor.cancel()
-        try:
-            await asyncio.wait_for(current_monitor, 1.5)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+    global playwright, browser, context, page
     for name, obj in (("page", page), ("context", context), ("browser", browser), ("playwright", playwright)):
         if obj is not None:
             try:
                 closer = getattr(obj, "close", None)
-                if closer:
-                    await asyncio.wait_for(closer(), 2.0)
-                elif name == "playwright":
-                    await asyncio.wait_for(obj.stop(), 2.0)
+                if closer: await asyncio.wait_for(closer(), 3)
+                elif name == "playwright": await asyncio.wait_for(obj.stop(), 3)
             except Exception as exc:
                 add_log(f"{name} cleanup: {type(exc).__name__}", "WARN")
     page = context = browser = playwright = None
 
 
-async def start_worker(url: str, session_id: str) -> None:
-    global playwright, browser, context, page, monitor_task
+async def launch_browser(url: str) -> None:
+    global playwright, browser, context, page
+    await validate_public_url(url)
+    add_log("Launching Chromium.", event_type="BROWSER_START", status="RUNNING")
+    playwright = await async_playwright().start()
+    browser = await asyncio.wait_for(playwright.chromium.launch(headless=True, args=[
+        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"]), 20)
+    context = await browser.new_context(viewport={"width":1280,"height":800}, java_script_enabled=True)
+    await context.route("**/*", route_guard)
+    page = await context.new_page()
+    page.on("pageerror", lambda exc: add_log(f"Page JavaScript error: {str(exc)[:220]}",
+        "ERROR", event_type="PAGE_JS_ERROR", status="FAILED"))
+    page.on("console", lambda msg: add_log(f"Console error: {msg.text[:220]}",
+        "ERROR", event_type="CONSOLE_ERROR", status="FAILED") if msg.type == "error" else None)
+    page.on("requestfailed", lambda req: add_log(
+        f"Request failed: {urlparse(req.url).hostname or 'unknown'} · {req.failure or 'unknown'}",
+        "WARN", event_type="NETWORK_REQUEST", status="FAILED"))
+    add_log("Opening requested website.", event_type="PAGE_NAVIGATION", status="RUNNING")
+    response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    try: await page.wait_for_load_state("load", timeout=12000)
+    except Exception: add_log("Page load event did not finish within 12 seconds; continuing with live page.",
+                               "WARN", event_type="PAGE_LOADING", status="UNCERTAIN")
+    state["title"] = await page.title()
+    state["diagnostics"] = await browser_diagnostics()
+    add_log(f"Website loaded: {state['title'] or page.url} · HTTP {response.status if response else 'unknown'}",
+            event_type="PAGE_LOADING", status="WORKED")
+    state.update(status="READY", message="Website ready. Load a JSON recording to replay.")
+
+
+def fingerprint_matches(el: dict, target: dict) -> bool:
+    for key, attr in (("tag","tag"),("id","id"),("testId","data-testid"),
+                      ("ariaLabel","aria-label"),("name","name")):
+        expected = target.get(key)
+        if expected and str(el.get(attr) or "").lower() != str(expected).lower(): return False
+    expected_text = " ".join(str(target.get("text") or "").split())
+    actual_text = " ".join(str(el.get("text") or "").split())
+    if expected_text and expected_text not in actual_text: return False
+    return True
+
+
+async def resolve_target(action: dict):
+    target = action.get("target") or {}
+    selectors = []
+    if target.get("selector"): selectors.append(str(target["selector"]))
+    if target.get("id"): selectors.append("#" + str(target["id"]).replace('"', '\\"'))
+    if target.get("testId"): selectors.append('[data-testid="' + str(target["testId"]).replace('"','\\"') + '"]')
+    if target.get("ariaLabel"): selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"','\\"') + '"]')
+    if target.get("name"): selectors.append('[name="' + str(target["name"]).replace('"','\\"') + '"]')
+    for selector in dict.fromkeys(selectors):
+        try:
+            loc = page.locator(selector)
+            count = await loc.count()
+            if count == 1:
+                info = await loc.evaluate("""el=>({tag:el.tagName.toLowerCase(),id:el.id,
+                  testId:el.getAttribute('data-testid'),ariaLabel:el.getAttribute('aria-label'),
+                  name:el.getAttribute('name'),text:(el.innerText||el.textContent||el.value||'').replace(/\\s+/g,' ').trim(),
+                  visible:!!(el.getClientRects().length)&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).display!=='none',
+                  disabled:!!el.disabled||el.getAttribute('aria-disabled')==='true'})""")
+                if fingerprint_matches(info, target) and info["visible"] and not info["disabled"]:
+                    return loc, None
+            elif count > 1:
+                continue
+        except Exception:
+            continue
+    return None, "Target not present or fingerprint did not match"
+
+
+async def execute_action(action: dict, number: int) -> tuple[bool, str]:
+    if action.get("type") != "click":
+        return False, f"Unsupported action type: {action.get('type')}"
+    action_url = action.get("url")
+    if action_url:
+        try:
+            expected = urlparse(action_url)
+            current = urlparse(page.url)
+            if expected.scheme not in ("http","https") or expected.netloc != current.netloc:
+                return False, "Recorded action origin does not match current page"
+        except Exception:
+            return False, "Invalid recorded action URL"
+    delay = min(max(int(action.get("gapMs") or 0), 0), 30000)
+    if delay: await asyncio.sleep(delay)
+    deadline = time.monotonic() + 12
+    last_reason = "Target not present"
+    while time.monotonic() < deadline and not stop_event.is_set():
+        locator, reason = await resolve_target(action)
+        if locator is not None:
+            try:
+                await locator.scroll_into_view_if_needed(timeout=1500)
+                await locator.click(timeout=3500, no_wait_after=True)
+                return True, "Click dispatched"
+            except Exception as exc:
+                last_reason = str(exc).splitlines()[0][:180]
+        else:
+            last_reason = reason or last_reason
+        await asyncio.sleep(0.3)
+    return False, "Timed out waiting for recorded target: " + last_reason
+
+
+async def run_replay(actions: list[dict]) -> None:
+    pending = list(enumerate(actions))
+    done: set[int] = set()
+    state.update(status="REPLAYING", replay_running=True, actions_total=len(actions),
+                 actions_done=0, success=0, failed=0, current_action=None)
+    add_log(f"Replay started with {len(actions)} recorded actions.", event_type="REPLAY_START", status="RUNNING")
     try:
-        add_log("Validating requested public URL.", event_type="URL_VALIDATION", status="RUNNING")
-        await validate_public_url(url)
-        add_log("Public URL validation passed.", event_type="URL_VALIDATION", status="WORKED")
-        add_log("Starting Playwright and Chromium.", event_type="BROWSER_START", status="RUNNING")
-        playwright = await async_playwright().start()
-        browser = await asyncio.wait_for(
-            playwright.chromium.launch(headless=True, args=[
-                "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                "--no-zygote",
-            ]),
-            timeout=18.0,
-        )
-        add_log("Chromium process launched successfully.", event_type="BROWSER_START", status="WORKED")
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            java_script_enabled=True,
-            accept_downloads=False,
-        )
-        await context.route("**/*", route_guard)
-        page = await context.new_page()
-        # Observe meaningful DOM mutations inside the page. data-nexus-id is
-        # deliberately excluded so our own scan annotations do not retrigger it.
-        await page.add_init_script("""(() => {
-          if (window.__nexusObserverInstalled) return;
-          window.__nexusObserverInstalled = true;
-          window.__nexusDomVersion = 0;
-          const start = () => {
-            if (!document.documentElement || window.__nexusObserver) return;
-            window.__nexusObserver = new MutationObserver(records => {
-              if (records.some(r => r.type === 'childList' || r.type === 'characterData' ||
-                ['class','style','hidden','disabled','href','type','role','aria-label','aria-hidden'].includes(r.attributeName))) {
-                window.__nexusDomVersion++;
-              }
-            });
-            window.__nexusObserver.observe(document.documentElement, {
-              subtree: true, childList: true, characterData: true, attributes: true,
-              attributeFilter: ['class','style','hidden','disabled','href','type','role','aria-label','aria-hidden']
-            });
-          };
-          if (document.documentElement) start();
-          else document.addEventListener('DOMContentLoaded', start, {once:true});
-        })();""")
-        page.on("pageerror", lambda exc: add_log(f"JavaScript exception: {str(exc)[:180]}", "ERROR", event_type="PAGE_JS_ERROR", status="FAILED"))
-        page.on("console", lambda msg: add_log(f"Browser console error: {msg.text[:180]}", "ERROR", event_type="CONSOLE_ERROR", status="FAILED") if msg.type == "error" else None)
-        page.on("requestfailed", lambda req: add_log(f"Network request failed: {urlparse(req.url).hostname or 'unknown host'} · {req.resource_type} · {req.failure or 'unknown failure'}", "WARN", event_type="NETWORK_REQUEST", status="FAILED"))
-        page.on("request", lambda req: add_log(f"Navigation request started: {req.method} {urlparse(req.url).hostname or 'unknown host'}", event_type="NETWORK_REQUEST", status="RUNNING") if req.is_navigation_request() else None)
-        async def record_navigation_finished(req):
-            if req.is_navigation_request():
-                try:
-                    response = await req.response()
-                    code = response.status if response else "no response"
-                    status = "WORKED" if response and response.ok else "FAILED"
-                    level = "INFO" if status == "WORKED" else "WARN"
-                    add_log(f"Navigation request finished: {urlparse(req.url).hostname or 'unknown host'} · HTTP {code}", level, event_type="NETWORK_REQUEST", status=status)
-                except Exception as exc:
-                    add_log(f"Navigation response unavailable: {type(exc).__name__}", "WARN", event_type="NETWORK_REQUEST", status="UNCERTAIN")
-        page.on("requestfinished", lambda req: asyncio.create_task(record_navigation_finished(req)))
-        page.set_default_timeout(7000)
-        page.set_default_navigation_timeout(20000)
-        add_log("Opening requested page; waiting for DOMContentLoaded.", event_type="PAGE_NAVIGATION", status="RUNNING")
-        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        if state["session_id"] != session_id or state["status"] != "STARTING":
-            return
-        state.update(status="RUNNING", message="Browser is running", started_at=time.time())
-        page_title = await page.title()
-        add_log(f"Page DOM loaded: {urlparse(page.url).hostname or 'website'} · title={page_title[:100]}", event_type="PAGE_NAVIGATION", status="WORKED")
-        await scan_page()
-        monitor_task = asyncio.create_task(monitor_loop())
-    except asyncio.CancelledError:
-        add_log("Start operation cancelled.")
-        raise
+        # Contextual scheduler: each pass checks all remaining actions against the
+        # live page, so a currently-present later-step target need not wait behind
+        # earlier actions that belong to a page state already passed.
+        while pending and not stop_event.is_set():
+            progressed = False
+            for original_index, action in list(pending):
+                if stop_event.is_set(): break
+                state["current_action"] = original_index + 1
+                locator, _ = await resolve_target(action)
+                if locator is None:
+                    continue
+                ok, detail = await execute_action(action, original_index + 1)
+                pending = [(i,a) for i,a in pending if i != original_index]
+                done.add(original_index)
+                state["actions_done"] = len(done)
+                if ok:
+                    state["success"] += 1
+                    add_log(f"Action {original_index+1}: {detail}.", event_type="REPLAY_ACTION", status="WORKED")
+                else:
+                    state["failed"] += 1
+                    add_log(f"Action {original_index+1}: {detail}.", "WARN",
+                            event_type="REPLAY_ACTION", status="FAILED")
+                progressed = True
+                await asyncio.sleep(0.25)
+                break
+            if not progressed:
+                # No current target: wait for client-side rendering / SPA updates.
+                await asyncio.sleep(0.35)
+                if stop_event.is_set(): break
+                # Bound a no-match wait, but keep retrying dynamic elements for 30s.
+                if not hasattr(run_replay, "_idle_since"): run_replay._idle_since = time.monotonic()
+                if time.monotonic() - run_replay._idle_since > 30:
+                    for idx, _ in pending:
+                        state["failed"] += 1
+                        add_log(f"Action {idx+1}: target did not appear within 30 seconds.",
+                                "WARN", event_type="REPLAY_ACTION", status="FAILED")
+                    pending.clear()
+                continue
+            if hasattr(run_replay, "_idle_since"): delattr(run_replay, "_idle_since")
     except Exception as exc:
-        state.update(status="ERROR", message=f"{type(exc).__name__}: {str(exc)[:220]}")
-        add_log(state["message"], "ERROR", event_type="BROWSER_START", status="FAILED")
-        await cleanup_browser()
+        add_log(f"Replay engine error: {type(exc).__name__}: {str(exc)[:220]}",
+                "ERROR", event_type="REPLAY_ERROR", status="FAILED")
+        state["message"] = str(exc)[:300]
+    finally:
+        state["replay_running"] = False
+        state["current_action"] = None
+        state["status"] = "READY" if page and not page.is_closed() else "STOPPED"
+        state["message"] = "Replay stopped." if stop_event.is_set() else "Replay finished."
+        add_log(state["message"] + f" Success {state['success']} · Failed {state['failed']}.",
+                event_type="REPLAY_FINISH", status="WORKED" if not state["failed"] else "UNCERTAIN")
 
 
 class StartRequest(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
 
 
-class ElementRequest(BaseModel):
-    element_id: str = Field(min_length=4, max_length=100)
+class ReplayRequest(BaseModel):
+    actions: list[dict[str, Any]] = Field(min_length=1, max_length=MAX_ACTIONS)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
+    stop_event.set()
+    if replay_task and not replay_task.done():
+        replay_task.cancel()
     await cleanup_browser()
 
 
-app = FastAPI(title="NEXUS AI Browser Monitor", version=APP_VERSION, lifespan=lifespan)
+app = FastAPI(title="NEXUS Replay Engine", version=APP_VERSION, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -523,199 +330,68 @@ async def home():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "app": "NEXUS AI", "version": APP_VERSION,
-            "browser_status": state["status"]}
-
-
-@app.get("/api/status")
-async def get_status(x_nexus_key: str | None = Header(default=None)):
-    require_key(x_nexus_key)
-    return {k: v for k, v in state.items() if k not in ("activity", "errors", "elements", "detections")}
+    return {"status":"healthy","app":"NEXUS Replay Engine","version":APP_VERSION,"browser_status":state["status"]}
 
 
 @app.get("/api/data")
 async def get_data(x_nexus_key: str | None = Header(default=None)):
     require_key(x_nexus_key)
-    return {"status": state["status"], "url": state["url"], "title": state["title"],
-            "message": state["message"], "elements": state["elements"],
-            "detections": state["detections"], "detected_elements": state["detected_elements"],
-            "diagnostics": state["diagnostics"],
-            "activity": state["activity"][-80:],
-            "events": state["events"][-100:],
-            "errors": state["errors"][-50:],
-            "privacy_shield": privacy_shield.snapshot()}
+    return {**state, "privacy_shield":privacy_shield.snapshot()}
 
 
 @app.post("/api/start")
 async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None)):
-    global start_task, last_dom_version, last_full_scan_at
+    global start_task
     require_key(x_nexus_key)
-    try:
-        await validate_public_url(req.url)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
+    try: await validate_public_url(req.url)
+    except ValueError as exc: raise HTTPException(400, str(exc))
     async with operation_lock:
-        if state["status"] in ("STARTING", "RUNNING", "STOPPING"):
+        if state["status"] in ("STARTING","RUNNING","REPLAYING","STOPPING"):
             raise HTTPException(409, f"Browser is currently {state['status'].lower()}.")
-        state.update(status="STARTING", url=req.url, title="", message="Starting browser...",
-                     elements=[], detections=[], detected_elements=[],
-                     diagnostics={"checks": [], "updated_at": None}, scan_summary=None,
-                     started_at=None, last_scan=None, session_id=str(uuid.uuid4()))
-        last_dom_version = None
-        last_full_scan_at = 0.0
-        sid = state["session_id"]
-        add_log(f"Start request accepted for {urlparse(req.url).hostname or 'website'}.", event_type="START_REQUEST", status="WORKED")
-        start_task = asyncio.create_task(start_worker(req.url, sid))
-    return {"ok": True, "status": "STARTING", "message": "Start request accepted."}
+        await cleanup_browser()
+        stop_event.clear()
+        state.update(status="STARTING",url=req.url,title="",message="Opening website...",
+                     actions_total=0,actions_done=0,success=0,failed=0,current_action=None,
+                     diagnostics={},started_at=time.time(),session_id=str(uuid.uuid4()))
+        try:
+            await launch_browser(req.url)
+        except Exception as exc:
+            await cleanup_browser()
+            state.update(status="ERROR",message=f"Browser start failed: {str(exc)[:250]}")
+            add_log(state["message"],"ERROR",event_type="BROWSER_START",status="FAILED")
+            raise HTTPException(502,state["message"])
+    return {"ok":True,"status":"READY","message":"Website loaded."}
+
+
+@app.post("/api/replay")
+async def replay(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
+    global replay_task
+    require_key(x_nexus_key)
+    if page is None or page.is_closed() or state["status"] not in ("READY",):
+        raise HTTPException(409,"Open a website before starting replay.")
+    if replay_task and not replay_task.done():
+        raise HTTPException(409,"Replay is already running.")
+    stop_event.clear()
+    replay_task = asyncio.create_task(run_replay(req.actions))
+    return {"ok":True,"status":"REPLAYING","actions":len(req.actions)}
 
 
 @app.post("/api/stop")
 async def stop(x_nexus_key: str | None = Header(default=None)):
-    global start_task
     require_key(x_nexus_key)
-    async with operation_lock:
-        if state["status"] == "STOPPED":
-            return {"ok": True, "status": "STOPPED"}
-        state.update(status="STOPPING", message="Stopping browser...")
-        add_log("Stop requested by operator.", event_type="BROWSER_STOP", status="RUNNING")
-        pending_start = start_task
-        if pending_start and not pending_start.done():
-            pending_start.cancel()
-            try:
-                await asyncio.wait_for(pending_start, 2.5)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-        await cleanup_browser()
-        start_task = None
-        state.update(status="STOPPED", message="Browser stopped.", elements=[], detections=[], detected_elements=[])
-        add_log("Browser stopped and browser resources released.", event_type="BROWSER_STOP", status="WORKED")
-    return {"ok": True, "status": "STOPPED"}
+    stop_event.set()
+    if replay_task and not replay_task.done():
+        try: await asyncio.wait_for(asyncio.shield(replay_task), 3)
+        except asyncio.TimeoutError: replay_task.cancel()
+    await cleanup_browser()
+    state.update(status="STOPPED",message="Browser stopped.",replay_running=False)
+    add_log("Browser and replay stopped; resources released.",event_type="BROWSER_STOP",status="WORKED")
+    return {"ok":True,"status":"STOPPED"}
 
 
-async def _approve_locked(req: ElementRequest, x_nexus_key: str | None):
+@app.get("/api/diagnostics")
+async def diagnostics(x_nexus_key: str | None = Header(default=None)):
     require_key(x_nexus_key)
-    action_id = uuid.uuid4().hex[:10].upper()
-    if state["status"] != "RUNNING" or page is None or page.is_closed():
-        add_log("Approval rejected: browser is not running.", "WARN", event_type="APPROVAL", status="FAILED", event_id=action_id)
-        raise HTTPException(409, "Browser is not running.")
-
-    element = next((x for x in state["elements"] if x["id"] == req.element_id), None)
-    is_predefined = False
-    if element is None:
-        element = next((x for x in state["detected_elements"] if x["id"] == req.element_id), None)
-        is_predefined = element is not None
-    if not element:
-        add_log(f"Approval {action_id}: element is no longer in the latest scan.", "WARN", event_type="APPROVAL", status="FAILED", event_id=action_id)
-        raise HTTPException(404, "Element is no longer in the latest scan. Scan again.")
-    display_text = element.get("text", req.element_id)
-    phase = "preflight"
-    try:
-        locator = page.locator(f'[data-nexus-id="{req.element_id}"]')
-        count = await locator.count()
-        if count == 0:
-            raise HTTPException(404, "Element is no longer on this page. Scan again.")
-
-        live = await locator.evaluate("""el => ({
-          tag: el.tagName.toLowerCase(), type: (el.getAttribute('type') || '').toLowerCase(),
-          text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0,150),
-          href: el.href || '', role: el.getAttribute('role') || '',
-          checked: 'checked' in el ? !!el.checked : null,
-          ariaPressed: el.getAttribute('aria-pressed'),
-          ariaExpanded: el.getAttribute('aria-expanded')
-        })""")
-        before_url = page.url
-        before_state = {"checked": live.get("checked"), "ariaPressed": live.get("ariaPressed"), "ariaExpanded": live.get("ariaExpanded")}
-        add_log(f"Approval {action_id} dispatching click: {display_text[:100]}.", event_type="APPROVAL", status="RUNNING", event_id=action_id)
-
-        phase = "click"
-        add_log(f"Dispatching click for {display_text[:100]}.", event_type="CLICK", status="RUNNING", event_id=action_id)
-        try:
-            await locator.scroll_into_view_if_needed(timeout=800)
-        except Exception:
-            pass  # scroll failure is non-fatal; attempt click anyway
-        try:
-            await locator.click(timeout=2000, no_wait_after=True)
-        except (PlaywrightTimeoutError, PlaywrightError):
-            # Element may be covered or not actionable via pointer events;
-            # dispatch a native DOM click event directly as fallback.
-            await locator.dispatch_event("click")
-        add_log(f"Click dispatched for {display_text[:100]}.", event_type="CLICK", status="WORKED", event_id=action_id)
-
-        # Verify only concrete, observable postconditions. A completed click alone is not proof
-        # that the website accepted or completed its business action.
-        verification = "UNVERIFIED"
-        evidence: list[str] = ["Playwright locator.click() completed."]
-        try:
-            # Give genuine navigation a short observation window without treating
-            # arbitrary DOM churn as proof that a website action succeeded.
-            for _ in range(6):
-                if page is None or page.is_closed() or page.url != before_url:
-                    break
-                await asyncio.sleep(0.2)
-            if page is None or page.is_closed():
-                verification = "OBSERVED"
-                evidence.append("The browser page closed after the click.")
-            else:
-                after_url = page.url
-                if after_url != before_url:
-                    verification = "OBSERVED"
-                    evidence.append("The page URL changed after the click.")
-                else:
-                    try:
-                        after_state = await asyncio.wait_for(locator.evaluate("""el => ({
-                          checked: 'checked' in el ? !!el.checked : null,
-                          ariaPressed: el.getAttribute('aria-pressed'),
-                          ariaExpanded: el.getAttribute('aria-expanded')
-                        })"""), timeout=1.2)
-                        for key, label in (("checked", "checked state"), ("ariaPressed", "aria-pressed state"), ("ariaExpanded", "expanded state")):
-                            if before_state.get(key) is not None and after_state.get(key) != before_state.get(key):
-                                verification = "OBSERVED"
-                                evidence.append(f"The control's {label} changed.")
-                    except Exception:
-                        try:
-                            if await locator.count() == 0:
-                                verification = "OBSERVED"
-                                evidence.append("The original element was removed from the DOM.")
-                        except Exception:
-                            pass
-        except Exception as verify_exc:
-            evidence.append(f"Post-click observation unavailable: {type(verify_exc).__name__}.")
-
-        status = "EFFECT_OBSERVED" if verification == "OBSERVED" else "CLICK_DISPATCHED"
-        result_message = "Click completed and a browser-side change was observed." if verification == "OBSERVED" else "Click completed; the website effect could not be verified from available evidence."
-        add_log(f"Approval {action_id} result: {status}. Evidence: {' '.join(evidence)}", event_type="ACTION_RESULT", status="WORKED" if verification == "OBSERVED" else "UNCERTAIN", event_id=action_id)
-        await scan_page()
-        return {"ok": True, "action_id": action_id, "status": status, "verification": verification, "evidence": evidence, "message": result_message}
-    except HTTPException as exc:
-        add_log(f"Approval {action_id} failed: {exc.detail}", "WARN", event_type="ACTION_RESULT", status="FAILED", event_id=action_id)
-        raise
-    except (PlaywrightTimeoutError, PlaywrightError) as exc:
-        detail = playwright_error_detail(exc)
-        add_log(f"Approval {action_id} click error ({phase}): {detail[:180]}", "WARN", event_type="ACTION_RESULT", status="FAILED", event_id=action_id)
-        raise HTTPException(409, f"Click failed ({phase}): {detail[:220]} Ref: {action_id}")
-    except Exception as exc:
-        add_log(f"Approval {action_id} failed: {type(exc).__name__}: {str(exc)[:200]}", "ERROR", event_type="ACTION_RESULT", status="FAILED", event_id=action_id)
-        raise HTTPException(500, f"Click failed. Check activity logs. Ref: {action_id}")
-
-
-@app.post("/api/approve")
-async def approve(req: ElementRequest, x_nexus_key: str | None = Header(default=None)):
-    require_key(x_nexus_key)
-    if approval_lock.locked():
-        raise HTTPException(409, "Another approval is already being processed. Please wait for its result.")
-    async with approval_lock:
-        return await _approve_locked(req, x_nexus_key)
-
-
-
-@app.post("/api/reject")
-async def reject(req: ElementRequest, x_nexus_key: str | None = Header(default=None)):
-    require_key(x_nexus_key)
-    element = next((x for x in state["elements"] if x["id"] == req.element_id), None)
-    if element is None:
-        element = next((x for x in state["detected_elements"] if x["id"] == req.element_id), None)
-    label = element.get("text", req.element_id) if element else req.element_id
-    selector_names = ", ".join(element.get("detection_names", [])) if element else ""
-    action_id = uuid.uuid4().hex[:10].upper()
-    add_log(f"Operator declined action for: {label[:100]} {f'[{selector_names}]' if selector_names else ''}. No browser interaction was sent.", event_type="APPROVAL_REJECTED", status="WORKED", event_id=action_id)
-    return {"ok": True, "action_id": action_id, "status": "REJECTED", "message": "Declined. No browser action was sent."}
+    if page is None or page.is_closed(): return state["diagnostics"]
+    state["diagnostics"] = await browser_diagnostics()
+    return state["diagnostics"]
