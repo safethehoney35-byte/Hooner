@@ -10,6 +10,9 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy project files into /app
+COPY . .
+
 # Install Chromium system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
@@ -42,7 +45,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Chromium without --with-deps
 RUN playwright install chromium
 
 RUN useradd --create-home --uid 10001 appuser \
@@ -50,4 +52,4 @@ RUN useradd --create-home --uid 10001 appuser \
 
 USER appuser
 
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
