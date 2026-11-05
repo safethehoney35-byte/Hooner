@@ -1,4 +1,4 @@
-# NEXUS AI Browser Monitor 1.1
+# NEXUS AI Browser Monitor 1.5.0
 
 A lightweight, single-session Playwright browser monitor with:
 - URL input and Start/Stop state machine
@@ -83,7 +83,7 @@ Configuration:
 This is an in-browser request policy/interceptor, **not** a forward proxy, VPN, IP anonymizer, or fingerprint spoofer. The website sees the public IP of the machine/network running Chromium. On a hosted Render deployment that is normally the hosting egress IP; on a local deployment it is normally the user's network public IP. DNS/WebRTC leak testing and fingerprint protection are not implemented by this module. Tracker blocking can affect some site features; set `NEXUS_BLOCK_TRACKERS=false` if compatibility problems occur.
 
 
-## Browser Diagnostics (v1.4.0)
+## Browser Diagnostics (v1.5.0)
 
 The dashboard now includes a **Browser diagnostics** panel. It reports browser capabilities and page/runtime measurements after the first scan, including JavaScript and storage availability, browser/OS hints, language and timezone, viewport and device-pixel ratio, touch/pointer support, selected browser APIs, WebDriver visibility, navigation timing, resource counts, and page visibility.
 
@@ -113,3 +113,11 @@ Each check is labelled `ok`, `info`, `warning`, `unsupported`, or `not collected
 - Detected elements remain inspection-only until the operator selects **Review** and explicitly confirms YES in the approval dialog. NO declines the action.
 - The existing manual approval endpoint, selector detection, safety eligibility checks, public-URL validation, privacy shield, and browser startup/navigation flow are preserved.
 - Runtime diagnostics also record uncaught page JavaScript exceptions, browser `console.error` messages, and failed network requests. Network request failures are warnings; JavaScript exceptions and console errors appear in the Error log.
+
+
+Dashboard and execution visibility (v1.5.0)
+The dashboard has a responsive browser view with a larger URL field, a unique detected-controls list, and a separate Awaiting Elements panel. The predefined selectors are shown only when matched on the current page and remain informational signals; they are not duplicated as separate approval targets. Ad/reward labels and configured selector matches are not actionable.
+
+The Live Execution panel is populated from backend events, not client-side simulated timers. Events include start requests, URL validation, Chromium launch, page navigation, page scans when their results change, navigation request outcomes, approval decisions, click dispatch, and errors. Event IDs can be searched in Render service logs. The server retains a bounded in-memory activity history; Render logs are the server-side diagnostic record.
+
+Approval results distinguish a completed Playwright click from an observed page effect. A changed URL, changed checkbox/ARIA state, or removed original element may be recorded as an observed effect. A completed click without a clear postcondition is reported as click dispatched / unverified, not as a successful website transaction. Each approval is re-checked against the current DOM and safety rules immediately before interaction.
