@@ -1,4 +1,4 @@
-# NEXUS AI Browser Monitor 1.6.0
+# NEXUS AI Browser Monitor 1.7.0
 
 A lightweight, single-session Playwright browser monitor with:
 - URL input and Start/Stop state machine
@@ -117,8 +117,14 @@ Each check is labelled `ok`, `info`, `warning`, `unsupported`, or `not collected
 
 
 Dashboard and execution visibility (v1.5.0)
-The dashboard has a responsive browser view with a larger URL field, a unique detected-controls list, and a separate Awaiting Elements panel. The predefined selectors are shown only when matched on the current page and remain informational signals; they are not duplicated as separate approval targets. Ad/reward labels and configured selector matches are not actionable.
+The dashboard has a responsive browser view with a larger URL field, a unique detected-controls list, and a separate Awaiting Elements panel. Predefined matches are flattened by DOM ID so the same page element is listed once even if multiple selectors match it. Each match row displays its individual YES/NO decision controls. YES is disabled for the bundled Linkvertise ad/reward-flow selectors and informational status markers; NO records the operator's decline. This preserves the safety boundary instead of converting ad-gate or reward markers into automated clicks.
 
 The Live Execution panel is populated from backend events, not client-side simulated timers. Events include start requests, URL validation, Chromium launch, page navigation, page scans when their results change, navigation request outcomes, approval decisions, click dispatch, and errors. Event IDs can be searched in Render service logs. The server retains a bounded in-memory activity history; Render logs are the server-side diagnostic record.
 
-Approval results distinguish a completed Playwright click from an observed page effect. A changed URL, changed checkbox/ARIA state, or removed original element may be recorded as an observed effect. A completed click without a clear postcondition is reported as click dispatched / unverified, not as a successful website transaction. Each approval is re-checked against the current DOM and safety rules immediately before interaction.
+Approval results distinguish a completed Playwright click from an observed page effect. Before a click, NEXUS scrolls the target into view and runs Playwright's non-interacting trial click to check actionability. If this preflight times out, the action is explicitly reported as NOT SENT and the Playwright call log plus a live hit-test snapshot are recorded. If the real click operation times out after dispatch begins, the outcome is reported as UNCERTAIN and NEXUS does not retry automatically. Render logs retain the diagnostic detail and a shared action ID. A changed URL, changed checkbox/ARIA state, or removed original element may be recorded as an observed page change; a completed click without a clear postcondition is reported as click dispatched / unverified, not as a successful website transaction. Each approval is re-checked against the current DOM and safety rules immediately before interaction.
+
+
+## Approval diagnostics (v1.7.0)
+The approval path is serialized so concurrent YES requests cannot race the single browser session. Each action performs a scroll-into-view and `locator.click(trial=True)` preflight before the real click. Preflight failures report that no click was sent and include Playwright's actionable call-log lines and a current DOM hit-test summary (bounding box, pointer-events, and center hit target). A timeout after the actual click call begins is marked `UNCERTAIN`; the system does not blindly retry because the page may already have received the click.
+
+The eight bundled Linkvertise selectors are still displayed as individual, deduplicated matches. Their YES controls are disabled because they represent ad-view, ad-skip, ad-gated continuation/destination, or informational status targets. NO decisions are recorded. Normal page controls continue to use the individual approval flow subject to the same safety checks.

@@ -16,10 +16,10 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from privacy_shield import PrivacyShield
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
 SCAN_INTERVAL = 0.7  # lightweight DOM-version check; full scans are event-driven
 MAX_ELEMENTS = 80
@@ -41,6 +41,30 @@ BLOCKED_TERMS = re.compile(
     r"delete|remove account|transfer|withdraw|payout|"
     r"ad|ads|advertisement|reward|rewards)\b", re.I
 )
+SAFE_INPUT_TYPES = {"", "button", "checkbox", "color", "date", "datetime-local", "email", "month", "number", "radio", "range", "search", "tel", "text", "time", "url", "week"}
+# These predefined selectors identify Linkvertise ad/reward flow targets or
+# status markers. Keep them visible and reviewable, but never turn them into
+# automated click targets. Ordinary page controls still use the normal policy.
+RESTRICTED_DETECTION_ACTIONS = {
+    "watchAds": "Ad-view / reward-flow target; automated interaction is disabled.",
+    "continueButton": "Ad-gated continuation target; automated interaction is disabled.",
+    "adCounter": "Informational ad counter; it is not an action control.",
+    "adLabel": "Informational ad label; it is not an action control.",
+    "skipAdContainer": "Ad-skip target; automated interaction is disabled.",
+    "successHeading": "Status heading; it is informational, not an action control.",
+    "contentReady": "Content-ready signal; it is informational, not an action control.",
+    "openHereButton": "Ad-gated destination target; automated interaction is disabled.",
+}
+
+
+def detection_approval_policy(detection_names: list[str], clickable: bool) -> tuple[bool, str]:
+    """Keep configured ad-flow selectors observable without making them click bypasses."""
+    restricted = [name for name in detection_names if name in RESTRICTED_DETECTION_ACTIONS]
+    if restricted:
+        return False, " ".join(RESTRICTED_DETECTION_ACTIONS[name] for name in restricted)
+    if not clickable:
+        return False, "This match is not a visible, enabled, supported interactive control."
+    return True, "Eligible for individual review."
 
 state: dict[str, Any] = {
     "status": "STOPPED", "url": "", "title": "", "message": "Ready",
@@ -57,6 +81,7 @@ last_dom_version: int | None = None
 last_full_scan_at = 0.0
 start_task: asyncio.Task | None = None
 operation_lock = asyncio.Lock()
+approval_lock = asyncio.Lock()
 log = logging.getLogger("nexus")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -83,6 +108,40 @@ def add_log(message: str, level: str = "INFO", *, event_type: str = "LOG", statu
     log_method = log.error if level == "ERROR" or status == "FAILED" else log.warning if level == "WARN" else log.info
     log_method("event_id=%s event=%s status=%s %s", event_id, event_type, status, message)
     return item
+
+
+def playwright_error_detail(exc: Exception, limit: int = 1100) -> str:
+    """Preserve Playwright's actionable call log instead of logging only its first line."""
+    raw = str(exc) or type(exc).__name__
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    useful = [line for line in lines if any(token in line.lower() for token in (
+        "waiting for", "locator resolved", "intercepts pointer", "not visible", "not enabled",
+        "not stable", "scroll", "element is", "retrying", "call log", "timeout"
+    ))]
+    detail = " | ".join(useful[-8:] if useful else lines[-6:])
+    return detail[:limit]
+
+
+async def inspect_click_target(locator) -> str:
+    """Return a compact live DOM hit-test explanation without interacting with the page."""
+    try:
+        info = await asyncio.wait_for(locator.evaluate("""el => {
+          const r = el.getBoundingClientRect();
+          const x = Math.max(0, Math.min(innerWidth - 1, r.left + r.width / 2));
+          const y = Math.max(0, Math.min(innerHeight - 1, r.top + r.height / 2));
+          const top = document.elementFromPoint(x, y);
+          const style = getComputedStyle(el);
+          return {
+            rect: `${Math.round(r.width)}x${Math.round(r.height)} at ${Math.round(r.left)},${Math.round(r.top)}`,
+            display: style.display, visibility: style.visibility, pointerEvents: style.pointerEvents,
+            disabled: !!el.disabled,
+            hitTarget: top ? `${top.tagName.toLowerCase()}${top.id ? '#' + top.id : ''}` : 'none',
+            covered: !!(top && top !== el && !el.contains(top))
+          };
+        }"""), timeout=1.5)
+        return "Live target: " + "; ".join(f"{k}={v}" for k, v in info.items())
+    except Exception as exc:
+        return f"Live target inspection unavailable: {type(exc).__name__}."
 
 
 def require_key(x_nexus_key: str | None) -> None:
@@ -192,9 +251,14 @@ async def scan_page() -> None:
                 const visible = style.display !== 'none' && style.visibility !== 'hidden'
                   && rect.width > 0 && rect.height > 0;
                 const tag = el.tagName.toLowerCase();
-                const text = (el.innerText || el.value || el.getAttribute('aria-label')
-                  || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 150);
-                return {id: el.dataset.nexusId, text: text || tag, tag, visible, disabled: !!el.disabled};
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                const aria = el.getAttribute('aria-label') || '';
+                const role = el.getAttribute('role') || '';
+                const rawHref = tag === 'a' ? el.href : '';
+                const href = (() => { try { const u = new URL(rawHref); u.search = ''; u.hash = ''; return u.href; } catch (_) { return ''; } })();
+                const text = (el.innerText || el.value || aria || el.getAttribute('title') || '')
+                  .trim().replace(/\\s+/g, ' ').slice(0, 150);
+                return {id: el.dataset.nexusId, text: text || tag, tag, type, href, aria, role, visible, disabled: !!el.disabled};
               });
               const sample = elements.length ? elements[0].text : '';
               return {name, selector, count: matches.length, sample, detection_only: true, elements};
@@ -264,8 +328,9 @@ async def scan_page() -> None:
         # once, by friendly selector name, in the separate Awaiting Elements panel.
         result = [item for item in result if item["id"] not in signal_ids]
         state["elements"] = result
-        # Flatten configured matches for display/debugging only. Selector matches
-        # are signals, not a second approval path; this avoids duplicate actions.
+        # Flatten configured selector matches by DOM id. The UI can show one
+        # decision row per unique match; server-side policy still decides whether
+        # a match is eligible for any interaction.
         detected_by_id: dict[str, dict] = {}
         for det in raw_detections:
             unique_elements = []
@@ -280,6 +345,25 @@ async def scan_page() -> None:
                     entry["detection_names"].append(det["name"])
             det["elements"] = unique_elements
             det["count"] = len(unique_elements)
+
+        for entry in detected_by_id.values():
+            descriptor = " ".join(str(entry.get(k, "")) for k in ("text", "aria", "href"))
+            entry["sensitive"] = bool(BLOCKED_TERMS.search(descriptor))
+            tag, control_type, role = entry.get("tag", ""), entry.get("type", ""), entry.get("role", "")
+            safe_tag = tag in {"a", "select", "textarea"} or (tag == "button" and control_type in {"", "button"}) or (tag == "input" and control_type in SAFE_INPUT_TYPES) or role == "button"
+            entry["clickable"] = bool(entry.get("visible") and not entry.get("disabled") and not entry["sensitive"] and safe_tag)
+            entry["approval_allowed"], entry["approval_reason"] = detection_approval_policy(
+                entry["detection_names"], entry["clickable"]
+            )
+
+        # Copy the flattened, deduplicated approval metadata back into each
+        # selector group so the UI can render one row per actual DOM element.
+        for det in raw_detections:
+            for el in det.get("elements", []):
+                merged = detected_by_id.get(el["id"], {})
+                for key in ("type", "href", "aria", "role", "sensitive", "clickable", "approval_allowed", "approval_reason", "detection_names"):
+                    if key in merged:
+                        el[key] = merged[key]
         state["detections"] = raw_detections
         state["detected_elements"] = list(detected_by_id.values())
         state["diagnostics"] = {
@@ -529,8 +613,7 @@ async def stop(x_nexus_key: str | None = Header(default=None)):
     return {"ok": True, "status": "STOPPED"}
 
 
-@app.post("/api/approve")
-async def approve(req: ElementRequest, x_nexus_key: str | None = Header(default=None)):
+async def _approve_locked(req: ElementRequest, x_nexus_key: str | None):
     require_key(x_nexus_key)
     action_id = uuid.uuid4().hex[:10].upper()
     if state["status"] != "RUNNING" or page is None or page.is_closed():
@@ -538,14 +621,23 @@ async def approve(req: ElementRequest, x_nexus_key: str | None = Header(default=
         raise HTTPException(409, "Browser is not running.")
 
     element = next((x for x in state["elements"] if x["id"] == req.element_id), None)
+    is_predefined = False
+    if element is None:
+        element = next((x for x in state["detected_elements"] if x["id"] == req.element_id), None)
+        is_predefined = element is not None
     if not element:
         add_log(f"Approval {action_id}: element is no longer in the latest scan.", "WARN", event_type="APPROVAL", status="FAILED", event_id=action_id)
         raise HTTPException(404, "Element is no longer in the latest scan. Scan again.")
     display_text = element.get("text", req.element_id)
+    if is_predefined and not element.get("approval_allowed"):
+        reason = element.get("approval_reason") or "This predefined match is informational or restricted."
+        add_log(f"Predefined approval blocked for {display_text[:80]} ({', '.join(element.get('detection_names', []))}): {reason}", "WARN", event_type="APPROVAL", status="FAILED", event_id=action_id)
+        raise HTTPException(403, reason)
     if not element.get("clickable") or element.get("sensitive"):
         add_log(f"Approval {action_id} blocked by eligibility/safety rules: {display_text[:100]}.", "WARN", event_type="APPROVAL", status="FAILED", event_id=action_id)
         raise HTTPException(403, "This element is not eligible for manual approval.")
 
+    phase = "preflight"
     try:
         locator = page.locator(f'[data-nexus-id="{req.element_id}"]')
         count = await locator.count()
@@ -565,12 +657,11 @@ async def approve(req: ElementRequest, x_nexus_key: str | None = Header(default=
             add_log(f"Approval {action_id} blocked by live safety re-check: {display_text[:100]}.", "WARN", event_type="APPROVAL", status="FAILED", event_id=action_id)
             raise HTTPException(403, "Safety filter blocked this element.")
 
-        safe_input_types = {"", "button", "checkbox", "color", "date", "datetime-local", "email", "month", "number", "radio", "range", "search", "tel", "text", "time", "url", "week"}
         live_tag = live["tag"]
         eligible = (
             live_tag in {"a", "select", "textarea"}
-            or (live_tag == "button" and live["type"] == "button")
-            or (live_tag == "input" and live["type"] in safe_input_types)
+            or (live_tag == "button" and live["type"] in {"", "button"})
+            or (live_tag == "input" and live["type"] in SAFE_INPUT_TYPES)
             or live.get("role") == "button"
         )
         if not eligible:
@@ -579,8 +670,15 @@ async def approve(req: ElementRequest, x_nexus_key: str | None = Header(default=
         before_url = page.url
         before_state = {"checked": live.get("checked"), "ariaPressed": live.get("ariaPressed"), "ariaExpanded": live.get("ariaExpanded")}
         add_log(f"Approval {action_id} accepted for: {display_text[:100]}.", event_type="APPROVAL", status="RUNNING", event_id=action_id)
+        add_log(f"Checking click actionability for {display_text[:100]}.", event_type="CLICK_PREFLIGHT", status="RUNNING", event_id=action_id)
+        await locator.scroll_into_view_if_needed(timeout=2500)
+        await locator.click(trial=True, timeout=3000, no_wait_after=True)
+        target_detail = await inspect_click_target(locator)
+        add_log(f"Click preflight passed for {display_text[:100]}. {target_detail}", event_type="CLICK_PREFLIGHT", status="WORKED", event_id=action_id)
+
+        phase = "click"
         add_log(f"Dispatching click for {display_text[:100]}.", event_type="CLICK", status="RUNNING", event_id=action_id)
-        await locator.click(timeout=7000, no_wait_after=True)
+        await locator.click(timeout=5000, no_wait_after=True)
         add_log(f"Playwright click completed for {display_text[:100]}.", event_type="CLICK", status="WORKED", event_id=action_id)
 
         # Verify only concrete, observable postconditions. A completed click alone is not proof
@@ -632,19 +730,48 @@ async def approve(req: ElementRequest, x_nexus_key: str | None = Header(default=
         add_log(f"Approval {action_id} failed: {exc.detail}", "WARN", event_type="ACTION_RESULT", status="FAILED", event_id=action_id)
         raise
     except PlaywrightTimeoutError as exc:
-        detail = str(exc).splitlines()[0][:240] if str(exc) else "Playwright timed out."
-        add_log(f"Approval {action_id} timed out: {detail}", "ERROR", event_type="ACTION_RESULT", status="FAILED", event_id=action_id)
-        raise HTTPException(408, f"Action timed out before Playwright confirmed completion. Ref: {action_id}")
+        detail = playwright_error_detail(exc)
+        target_detail = await inspect_click_target(locator) if "locator" in locals() else "Live target inspection unavailable."
+        if phase == "preflight":
+            message = f"Click was NOT sent: Playwright could not confirm the target was actionable. {detail} {target_detail}"
+            add_log(f"Approval {action_id} preflight timed out; no click was sent. {message}", "WARN", event_type="ACTION_RESULT", status="FAILED", event_id=action_id)
+            raise HTTPException(409, f"CLICK_NOT_SENT: {message} Ref: {action_id}")
+        message = f"Playwright did not confirm click completion. The outcome is uncertain; NEXUS did not retry. {detail} {target_detail}"
+        add_log(f"Approval {action_id} click outcome uncertain: {message}", "WARN", event_type="ACTION_RESULT", status="UNCERTAIN", event_id=action_id)
+        raise HTTPException(408, f"OUTCOME_UNCERTAIN: {message} Ref: {action_id}")
+    except PlaywrightError as exc:
+        detail = playwright_error_detail(exc)
+        target_detail = await inspect_click_target(locator) if "locator" in locals() else "Live target inspection unavailable."
+        if phase == "preflight":
+            message = f"Click was NOT sent: Playwright preflight failed. {detail} {target_detail}"
+            add_log(f"Approval {action_id} preflight failed; no click was sent. {message}", "WARN", event_type="ACTION_RESULT", status="FAILED", event_id=action_id)
+            raise HTTPException(409, f"CLICK_NOT_SENT: {message} Ref: {action_id}")
+        message = f"Playwright could not confirm click completion. Outcome is uncertain; NEXUS did not retry. {detail} {target_detail}"
+        add_log(f"Approval {action_id} click outcome uncertain: {message}", "WARN", event_type="ACTION_RESULT", status="UNCERTAIN", event_id=action_id)
+        raise HTTPException(408, f"OUTCOME_UNCERTAIN: {message} Ref: {action_id}")
     except Exception as exc:
         add_log(f"Approval {action_id} failed: {type(exc).__name__}: {str(exc)[:200]}", "ERROR", event_type="ACTION_RESULT", status="FAILED", event_id=action_id)
         raise HTTPException(500, f"Click failed. Check activity logs. Ref: {action_id}")
+
+
+@app.post("/api/approve")
+async def approve(req: ElementRequest, x_nexus_key: str | None = Header(default=None)):
+    require_key(x_nexus_key)
+    if approval_lock.locked():
+        raise HTTPException(409, "Another approval is already being processed. Please wait for its result.")
+    async with approval_lock:
+        return await _approve_locked(req, x_nexus_key)
+
 
 
 @app.post("/api/reject")
 async def reject(req: ElementRequest, x_nexus_key: str | None = Header(default=None)):
     require_key(x_nexus_key)
     element = next((x for x in state["elements"] if x["id"] == req.element_id), None)
+    if element is None:
+        element = next((x for x in state["detected_elements"] if x["id"] == req.element_id), None)
     label = element.get("text", req.element_id) if element else req.element_id
+    selector_names = ", ".join(element.get("detection_names", [])) if element else ""
     action_id = uuid.uuid4().hex[:10].upper()
-    add_log(f"Operator declined action for: {label[:100]}. No browser interaction was sent.", event_type="APPROVAL_REJECTED", status="WORKED", event_id=action_id)
+    add_log(f"Operator declined action for: {label[:100]} {f'[{selector_names}]' if selector_names else ''}. No browser interaction was sent.", event_type="APPROVAL_REJECTED", status="WORKED", event_id=action_id)
     return {"ok": True, "action_id": action_id, "status": "REJECTED", "message": "Declined. No browser action was sent."}
