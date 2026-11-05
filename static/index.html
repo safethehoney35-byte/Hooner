@@ -42,13 +42,13 @@
       <div class="card-head"><h3>Detected elements</h3><span class="count" id="elementCount">0 found</span></div>
       <p class="hint">Controls found on the current page. Each item has its own YES / NO decision.</p>
       <div class="element-list" id="elements"><div class="empty">Start a browser session to inspect page controls.</div></div>
-      <p class="notice">Sensitive, destructive, payment, account, and restricted ad/reward actions remain blocked. The page is re-checked before each approved interaction.</p>
+      <p class="notice">Sensitive, destructive, payment, account, and restricted ad/reward actions remain blocked. A YES approval runs an actionability check before dispatch; a timeout is never silently retried.</p>
     </section>
     <section class="card">
       <div class="card-head"><h3>Awaiting elements</h3><span class="count" id="awaitingCount">0 matched</span></div>
       <p class="hint">Your predefined selectors appear here only when a real match exists on this page.</p>
       <div class="awaiting-list" id="awaiting"><div class="empty">No predefined elements matched yet.</div></div>
-      <p class="notice">These configured selectors are detection signals, not a second set of click targets. This prevents duplicate approvals and keeps ad/reward-flow markers informational.</p>
+      <p class="notice">Each unique predefined match is listed once with its own decision row. YES is enabled only for permitted interactive targets; ad/reward-flow controls and informational markers remain restricted. NO always records your decision.</p>
     </section>
   </div>
   <section class="card bottom-card">
@@ -102,18 +102,27 @@ function renderElements(items){
   document.querySelectorAll('[data-approve]').forEach(b=>b.addEventListener('click',()=>openApproval(b.dataset.approve)));
   document.querySelectorAll('[data-reject]').forEach(b=>b.addEventListener('click',()=>rejectElement(b.dataset.reject)));
 }
-function renderAwaiting(groups){
-  const matched=(groups||[]).filter(g=>(g.count||0)>0);
-  $('awaitingCount').textContent=`${matched.length} matched`;$('awaitingMetric').textContent=matched.length;
-  if(!matched.length){$('awaiting').innerHTML='<div class="empty">No predefined elements matched this page.</div>';return}
-  $('awaiting').innerHTML=matched.map(g=>{
-    const name=friendlyNames[g.name]||g.name;
-    const visible=(g.elements||[]).filter(e=>e.visible).length;
-    const sample=g.sample||((g.elements||[])[0]?.text)||'Matched selector';
-    return `<article class="awaiting-card"><div class="element-main"><div class="element-copy"><div class="awaiting-title">${esc(name)}</div><div class="awaiting-meta">${esc(sample)}</div></div><div class="awaiting-right"><span class="signal-tag">${g.count} match${g.count===1?'':'es'}</span></div></div><div class="awaiting-meta">${visible} visible · detection signal</div></article>`;
+function renderAwaiting(items){
+  const matches=(items||[]).filter(e=>e.visible);
+  $('awaitingCount').textContent=`${matches.length} matched`;$('awaitingMetric').textContent=matches.length;
+  if(!matches.length){$('awaiting').innerHTML='<div class="empty">No predefined elements matched this page.</div>';return}
+  $('awaiting').innerHTML=matches.map((e,index)=>{
+    const names=(e.detection_names||[]).map(n=>friendlyNames[n]||n);
+    const title=names.join(' · ')||'Predefined match';
+    const action=stateFor(e.id);
+    const status=action?`<span class="element-state ${esc(action.kind)}">${esc(action.label)}</span>`:
+      `<span class="element-state">${e.approval_allowed?'Awaiting review':'Restricted / signal'}</span>`;
+    const yes=e.approval_allowed
+      ? `<button class="yes" data-approve="${esc(e.id)}">YES · Review</button>`
+      : `<button class="yes" disabled title="${esc(e.approval_reason||'This predefined signal cannot be clicked.')}">YES · Unavailable</button>`;
+    const no=`<button class="no" data-reject="${esc(e.id)}">NO</button>`;
+    return `<article class="awaiting-card"><div class="element-main"><span class="number">${index+1}</span><div class="element-copy"><div class="awaiting-title">${esc(title)}</div><div class="awaiting-meta">${esc(e.text||e.tag||'Matched element')} · ${esc(typeName(e))}</div>${e.href?`<div class="awaiting-meta">${esc(e.href)}</div>`:''}</div><div class="awaiting-right">${status}</div></div><div class="element-actions">${yes}${no}</div><div class="awaiting-meta">${esc(e.approval_allowed?'Matched configured selector. Review is individual to this DOM element.':(e.approval_reason||'This match is for observation only.'))}</div></article>`;
   }).join('');
+  document.querySelectorAll('#awaiting [data-approve]').forEach(b=>b.addEventListener('click',()=>openApproval(b.dataset.approve)));
+  document.querySelectorAll('#awaiting [data-reject]').forEach(b=>b.addEventListener('click',()=>rejectElement(b.dataset.reject)));
 }
-function eventLabel(e){const labels={START_REQUEST:'Start request accepted',URL_VALIDATION:'URL validation',BROWSER_START:'Starting browser',PAGE_NAVIGATION:'Opening website',PAGE_SCAN:'Scanning page',DOM_MONITOR:'DOM monitor',NETWORK_REQUEST:'Network request',CLICK:'Browser click',APPROVAL:'Approval',APPROVAL_REJECTED:'Action declined',ACTION_RESULT:'Action result',BROWSER_STOP:'Stopping browser',PAGE_JS_ERROR:'Page JavaScript error',CONSOLE_ERROR:'Console error'};return labels[e.event_type]||e.event_type||'Browser event'}
+
+function eventLabel(e){const labels={START_REQUEST:'Start request accepted',URL_VALIDATION:'URL validation',BROWSER_START:'Starting browser',PAGE_NAVIGATION:'Opening website',PAGE_SCAN:'Scanning page',DOM_MONITOR:'DOM monitor',CLICK_PREFLIGHT:'Click actionability check',NETWORK_REQUEST:'Network request',CLICK:'Browser click',APPROVAL:'Approval',APPROVAL_REJECTED:'Action declined',ACTION_RESULT:'Action result',BROWSER_STOP:'Stopping browser',PAGE_JS_ERROR:'Page JavaScript error',CONSOLE_ERROR:'Console error'};return labels[e.event_type]||e.event_type||'Browser event'}
 function renderEvents(events){
   const list=(events||[]).slice(-45).reverse();$('eventCount').textContent=`${(events||[]).length} events`;
   if(!list.length){$('liveEvents').innerHTML='<div class="empty">Waiting for browser events.</div>';return}
@@ -121,13 +130,13 @@ function renderEvents(events){
 }
 function renderDiagnostics(d){const checks=d?.checks||[];const filter=$('diagFilter').value;const shown=checks.filter(x=>filter==='all'||x.status===filter);const counts=checks.reduce((a,x)=>(a[x.status]=(a[x.status]||0)+1,a),{});$('diagCount').textContent=checks.length?`${checks.length} checks`:'Waiting';$('diagSummary').textContent=checks.length?`${counts.ok||0} OK · ${counts.warning||0} warnings · ${counts.unsupported||0} unsupported · ${counts.info||0} info`:'No diagnostic data yet';$('diagnostics').innerHTML=shown.length?shown.map(x=>`<div class="diag-item"><div class="diag-top"><b>${esc(x.name)}</b><span class="diag-status ${esc(x.status)}">${esc(String(x.status).replace('_',' '))}</span></div><small>${esc(x.detail)}</small></div>`).join(''):'<div class="empty">No checks match this filter.</div>'}
 function renderLogs(id,items,empty){$(id).innerHTML=items?.length?items.slice().reverse().map(x=>`<div class="log ${x.level==='ERROR'||x.status==='FAILED'?'ERROR':''}"><time>${esc(x.time||'')} · ${esc(x.id||'')} · ${esc(x.event_type||x.level||'EVENT')}</time>${esc(x.message||'')}</div>`).join(''):`<div class="empty">${empty}</div>`}
-function renderAll(d){lastData=d;setStatus(d.status,d.status==='ERROR'?d.message:'');renderElements(d.elements||[]);renderAwaiting(d.detections||[]);renderDiagnostics(d.diagnostics||{});renderLogs('activity',d.activity||[],'No activity yet.');renderLogs('errors',d.errors||[],'No errors recorded.');renderEvents(d.events||d.activity||[])}
+function renderAll(d){lastData=d;setStatus(d.status,d.status==='ERROR'?d.message:'');renderElements(d.elements||[]);renderAwaiting(d.detected_elements||[]);renderDiagnostics(d.diagnostics||{});renderLogs('activity',d.activity||[],'No activity yet.');renderLogs('errors',d.errors||[],'No errors recorded.');renderEvents(d.events||d.activity||[])}
 async function refresh(){if(!key||pollBusy)return;pollBusy=true;try{const d=await api('/api/data');renderAll(d);$('topError').textContent=''}catch(e){if(e.message.includes('Access key')){$('keyModal').classList.add('show')}else if(e.message.includes('not configured')){$('topError').textContent=e.message;setStatus('ERROR',e.message)}else{$('topError').textContent=e.message}}finally{pollBusy=false}}
-function openApproval(id){const e=(lastData?.elements||[]).find(x=>x.id===id);if(!e)return;pending=id;$('approvalTitle').textContent='Confirm this action';$('approvalText').textContent=`${e.text} · ${typeName(e)}. NEXUS will re-check this exact element before sending the click.`;$('approvalError').textContent='';$('approvalModal').classList.add('show')}
+function openApproval(id){const e=[...(lastData?.elements||[]),...(lastData?.detected_elements||[])].find(x=>x.id===id);if(!e)return;if(e.approval_allowed===false){$('topError').textContent=e.approval_reason||'This predefined match is not an allowed click target.';return}pending=id;$('approvalTitle').textContent='Confirm this action';$('approvalText').textContent=`${e.text} · ${typeName(e)}. NEXUS will re-check this exact element before sending the click.`;$('approvalError').textContent='';$('approvalModal').classList.add('show')}
 function closeApproval(){$('approvalModal').classList.remove('show');pending=null}
 async function rejectElement(id){try{const result=await api('/api/reject',{method:'POST',body:JSON.stringify({element_id:id})});actionStates.set(id,{kind:'rejected',label:'Declined'});await refresh()}catch(e){$('topError').textContent=`Could not record NO decision: ${e.message}`}}
 $('cancelApproval').onclick=closeApproval;
-$('confirm').onclick=async()=>{if(!pending)return;const id=pending;$('confirm').disabled=true;$('confirm').textContent='Sending…';$('approvalError').textContent='';try{const result=await api('/api/approve',{method:'POST',body:JSON.stringify({element_id:id})});const verified=result.verification==='OBSERVED';actionStates.set(id,{kind:verified?'success':'uncertain',label:verified?'Effect observed':'Click sent · unverified'});$('approvalText').textContent=result.message+(result.evidence?.length?' Evidence: '+result.evidence.join(' '):'');$('approvalTitle').textContent=verified?'Browser change observed':'Click dispatched';$('approvalError').textContent=result.action_id?`Reference: ${result.action_id}`:'';await refresh();setTimeout(()=>{$('approvalModal').classList.remove('show');pending=null;$('approvalTitle').textContent='Confirm this action';},1700)}catch(e){actionStates.set(id,{kind:'failed',label:'Failed'});$('approvalTitle').textContent='Action failed';$('approvalError').textContent=e.message;await refresh()}finally{$('confirm').disabled=false;$('confirm').textContent='Yes, approve'}};
+$('confirm').onclick=async()=>{if(!pending)return;const id=pending;$('confirm').disabled=true;$('confirm').textContent='Sending…';$('approvalError').textContent='';try{const result=await api('/api/approve',{method:'POST',body:JSON.stringify({element_id:id})});const verified=result.verification==='OBSERVED';actionStates.set(id,{kind:verified?'success':'uncertain',label:verified?'Effect observed':'Click sent · unverified'});$('approvalText').textContent=result.message+(result.evidence?.length?' Evidence: '+result.evidence.join(' '):'');$('approvalTitle').textContent=verified?'Browser change observed':'Click dispatched';$('approvalError').textContent=result.action_id?`Reference: ${result.action_id}`:'';await refresh();setTimeout(()=>{$('approvalModal').classList.remove('show');pending=null;$('approvalTitle').textContent='Confirm this action';},1700)}catch(e){const uncertain=e.message.startsWith('OUTCOME_UNCERTAIN:');actionStates.set(id,{kind:uncertain?'uncertain':'failed',label:uncertain?'Outcome uncertain':'Failed'});$('approvalTitle').textContent=uncertain?'Click outcome uncertain':'Action failed';$('approvalError').textContent=e.message.replace(/^OUTCOME_UNCERTAIN:\s*/,'').replace(/^CLICK_NOT_SENT:\s*/,'');await refresh()}finally{$('confirm').disabled=false;$('confirm').textContent='Yes, approve'}};
 $('saveKey').onclick=async()=>{key=$('keyInput').value.trim();if(!key){$('keyError').textContent='Enter your access key.';return}sessionStorage.setItem('nexus_key',key);try{await api('/api/data');$('keyModal').classList.remove('show');$('keyError').textContent='';refresh()}catch(e){$('keyError').textContent=e.message;sessionStorage.removeItem('nexus_key');key=''}};
 $('startBtn').onclick=async()=>{const url=$('url').value.trim();if(!url){$('topError').textContent='Enter a website URL first.';return}$('topError').textContent='';setStatus('STARTING');try{await api('/api/start',{method:'POST',body:JSON.stringify({url})});await refresh()}catch(e){setStatus('ERROR',e.message)}};
 $('stopBtn').onclick=async()=>{setStatus('STOPPING');try{await api('/api/stop',{method:'POST'});await refresh()}catch(e){setStatus('ERROR',e.message)}};
