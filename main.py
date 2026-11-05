@@ -37,8 +37,7 @@ DETECTION_ONLY = {
     "openHereButton": ".success-wrapper button",
 }
 BLOCKED_TERMS = re.compile(
-    r"\b(ad|ads|advert|advertisement|reward|claim|skip ad|watch ads|"
-    r"membership|payment|pay now|purchase|checkout|subscribe|"
+    r"\b(payment|pay now|purchase|checkout|"
     r"delete|remove account|transfer|withdraw|payout)\b", re.I
 )
 
