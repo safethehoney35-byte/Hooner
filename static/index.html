@@ -27,7 +27,7 @@
 </nav>
 <main class="view" id="browserView">
   <section class="hero">
-    <div class="hero-head"><div><h2>Browser monitor</h2><p class="sub">Paste a public URL, start Chromium, and review detected controls individually. Actions require your confirmation.</p></div></div>
+    <div class="hero-head"><div><h2>Browser monitor</h2><p class="sub">Paste a public URL and start Chromium. NEXUS watches for page changes continuously and reviews detected controls individually; actions still require your confirmation.</p></div></div>
     <label class="url-label" for="url">Website URL</label>
     <div class="url-row"><input id="url" class="url" type="url" placeholder="https://example.com/page" autocomplete="url" spellcheck="false"><button class="btn primary" id="startBtn">Start browser</button><button class="btn stop" id="stopBtn" disabled>Stop</button></div>
     <div class="top-error" id="topError" role="status" aria-live="polite"></div>
@@ -113,7 +113,7 @@ function renderAwaiting(groups){
     return `<article class="awaiting-card"><div class="element-main"><div class="element-copy"><div class="awaiting-title">${esc(name)}</div><div class="awaiting-meta">${esc(sample)}</div></div><div class="awaiting-right"><span class="signal-tag">${g.count} match${g.count===1?'':'es'}</span></div></div><div class="awaiting-meta">${visible} visible · detection signal</div></article>`;
   }).join('');
 }
-function eventLabel(e){const labels={START_REQUEST:'Start request accepted',URL_VALIDATION:'URL validation',BROWSER_START:'Starting browser',PAGE_NAVIGATION:'Opening website',PAGE_SCAN:'Scanning page',NETWORK_REQUEST:'Network request',CLICK:'Browser click',APPROVAL:'Approval',APPROVAL_REJECTED:'Action declined',ACTION_RESULT:'Action result',BROWSER_STOP:'Stopping browser',PAGE_JS_ERROR:'Page JavaScript error',CONSOLE_ERROR:'Console error'};return labels[e.event_type]||e.event_type||'Browser event'}
+function eventLabel(e){const labels={START_REQUEST:'Start request accepted',URL_VALIDATION:'URL validation',BROWSER_START:'Starting browser',PAGE_NAVIGATION:'Opening website',PAGE_SCAN:'Scanning page',DOM_MONITOR:'DOM monitor',NETWORK_REQUEST:'Network request',CLICK:'Browser click',APPROVAL:'Approval',APPROVAL_REJECTED:'Action declined',ACTION_RESULT:'Action result',BROWSER_STOP:'Stopping browser',PAGE_JS_ERROR:'Page JavaScript error',CONSOLE_ERROR:'Console error'};return labels[e.event_type]||e.event_type||'Browser event'}
 function renderEvents(events){
   const list=(events||[]).slice(-45).reverse();$('eventCount').textContent=`${(events||[]).length} events`;
   if(!list.length){$('liveEvents').innerHTML='<div class="empty">Waiting for browser events.</div>';return}
