@@ -1,40 +1,594 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>NEXUS · Replay Engine</title>
 <style>
-:root{color-scheme:dark;--bg:#080d17;--panel:#111b2b;--line:#263750;--muted:#91a2bb;--text:#eef4ff;--green:#43d69a;--red:#ff7185;--amber:#f5c46a}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 10% 0%,#172a45 0,transparent 40%),var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif}.wrap{width:min(1000px,100% - 30px);margin:28px auto 50px}.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}.brand{display:flex;gap:12px;align-items:center}.logo{width:43px;height:43px;display:grid;place-items:center;border-radius:13px;background:#173d3a;color:var(--green);font-weight:900;font-size:22px;border:1px solid #287b68}.brand h1{font-size:19px;letter-spacing:.12em;margin:0}.brand small{color:var(--muted)}.pill{border:1px solid var(--line);border-radius:30px;padding:7px 12px;color:var(--muted);font-size:11px}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#75849a;margin-right:7px}.dot.READY,.dot.REPLAYING{background:var(--green);box-shadow:0 0 10px #43d69a}.dot.ERROR{background:var(--red)}.grid{display:grid;grid-template-columns:1.2fr .8fr;gap:14px}.card{background:linear-gradient(145deg,#142137,#0f1929);border:1px solid var(--line);border-radius:16px;padding:19px;margin-bottom:14px;min-width:0}.wide{grid-column:1/-1}h2{font-size:18px;margin:0 0 5px}h3{font-size:13px;letter-spacing:.04em;margin:0 0 13px}.muted,.hint{color:var(--muted);font-size:12px;margin:0 0 15px}.label{display:block;color:#c8d5e8;font-size:11px;margin:12px 0 6px}.field{width:100%;background:#091321;border:1px solid #344762;border-radius:10px;color:var(--text);padding:13px;outline:none;min-width:0}.field:focus{border-color:#55cba2}.row{display:flex;gap:9px;align-items:center}.row>*{min-width:0}.url{flex:1}.btn{border:1px solid #3c5878;border-radius:9px;background:#203550;color:white;padding:11px 15px;font-weight:700;cursor:pointer}.btn.primary{background:#146447;border-color:#258b68}.btn.stop{background:#612b39;border-color:#8b4050}.btn:disabled{opacity:.45;cursor:not-allowed}.filebox{border:1px dashed #49617f;background:#0a1524;border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;gap:12px}.filebox input{max-width:100%;color:var(--muted)}.fileinfo{color:var(--muted);font-size:11px;margin-top:9px;overflow-wrap:anywhere}.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}.stat{padding:13px;border:1px solid var(--line);border-radius:11px;background:#0b1524}.stat small{display:block;color:var(--muted);font-size:10px}.stat strong{font-size:22px}.bar{height:7px;background:#26364d;border-radius:10px;overflow:hidden;margin-top:12px}.bar>i{display:block;height:100%;width:0;background:var(--green);transition:width .2s}.current{background:#091321;border:1px solid #243751;padding:12px;border-radius:10px;font:12px ui-monospace,monospace;overflow-wrap:anywhere;color:#9ceacb;min-height:44px}.logs{max-height:360px;overflow:auto;display:grid;gap:7px}.log{background:#091321;border:1px solid #24354d;border-radius:9px;padding:9px 11px;font:11px/1.5 ui-monospace,monospace;overflow-wrap:anywhere}.log time{color:#8296b2;display:block;font-size:10px}.diag{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.check{border:1px solid var(--line);border-radius:9px;padding:10px}.check b{font-size:11px}.check small{display:block;color:var(--muted);font-size:10px;overflow-wrap:anywhere}.ok{color:var(--green)}.warn{color:var(--amber)}.err{color:var(--red)}.error{color:#ff9aaa;font-size:12px;margin-top:9px;min-height:18px}.modal{position:fixed;inset:0;background:#020711dd;display:none;place-items:center;padding:18px}.modal.show{display:grid}.dialog{width:min(420px,100%);background:#142137;border:1px solid #3a5272;border-radius:15px;padding:20px}.dialog h2{margin-bottom:8px}.footer{text-align:center;color:#657995;font-size:10px;margin-top:18px}@media(max-width:700px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}.stats{grid-template-columns:repeat(2,1fr)}.row{flex-wrap:wrap}.url{flex-basis:100%}.row .btn{flex:1}.top{align-items:flex-start}.diag{grid-template-columns:1fr}.wrap{width:calc(100% - 22px);margin-top:16px}}
-</style></head>
-<body><div class="wrap">
-<header class="top"><div class="brand"><div class="logo">N</div><div><h1>NEXUS</h1><small>JSON Replay Engine · v2.1</small></div></div><div class="pill"><span class="dot" id="dot"></span><span id="status">DISCONNECTED</span></div></header>
-<section class="card"><h2>Browser session</h2><p class="muted">Enter the destination URL. NEXUS opens the page and waits for your recorded JSON workflow.</p><label class="label" for="url">WEBSITE URL</label><div class="row"><input class="field url" id="url" type="url" placeholder="https://example.com"><button class="btn primary" id="open">OPEN PAGE</button><button class="btn stop" id="stop">STOP</button></div><div class="error" id="error"></div></section>
-<div class="grid">
-<section class="card"><h3>RECORDED WORKFLOW</h3><p class="hint">Load the JSON exported by your existing recorder. The action structure is kept compatible.</p><div class="filebox"><input id="file" type="file" accept=".json,application/json"><button class="btn" id="clear">CLEAR</button></div><div class="fileinfo" id="fileinfo">No JSON loaded.</div><div style="margin-top:14px" class="row"><button class="btn" id="inspect" disabled>⌕ INSPECT ELEMENTS</button><button class="btn primary" id="replay" disabled>▶ START REPLAY</button><button class="btn stop" id="halt" disabled>PAUSE / STOP REPLAY</button></div></section>
-<section class="card"><h3>ELEMENT INSPECTOR</h3><div class="hint" id="inspectResults">Load a workflow and open an authorized test page, then inspect matching elements. Unique visible targets are outlined in green; duplicates are reported without guessing.</div></section>\n<section class="card"><h3>LIVE ACTION</h3><div class="current" id="current">Waiting for website and workflow.</div><p class="hint" style="margin:12px 0 0">Targets are resolved from the selectors and fingerprints already stored in your recording. Detection uses a short bounded wait; inspect targets first to see duplicates and visibility.</p></section>
-<section class="card wide"><h3>EXECUTION</h3><div class="stats"><div class="stat"><small>WORKFLOW ACTIONS</small><strong id="total">0</strong></div><div class="stat"><small>COMPLETED</small><strong id="done">0</strong></div><div class="stat"><small>CLICK DISPATCHED</small><strong class="ok" id="success">0</strong></div><div class="stat"><small>RESPONSE SIGNALS</small><strong class="ok" id="verified">0</strong></div><div class="stat"><small>FAILED</small><strong class="err" id="failed">0</strong></div></div><div class="bar"><i id="progress"></i></div></section>
-<section class="card wide"><h3>ACTION-BY-ACTION PROOF</h3><p class="hint">Detected, dispatched and observable page response are separate facts. A click dispatch is not proof that the website completed its intended operation.</p><div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;text-align:left"><thead><tr style="color:#91a2bb"><th style="padding:8px">#</th><th>ELEMENT / TARGET</th><th>DETECTED</th><th>CLICK</th><th>PAGE RESPONSE</th><th>TIME</th><th>STATUS</th></tr></thead><tbody id="actionRows"><tr><td colspan="7" class="hint">Load a workflow and start replay to see per-element results.</td></tr></tbody></table></div><p class="hint" id="runTime" style="margin:10px 0 0">Elapsed: —</p></section>
-<section class="card wide"><h3>DIAGNOSTICS</h3><div class="diag" id="diagnostics"><div class="hint">Open a website to collect browser diagnostics.</div></div></section>
-<section class="card wide"><div class="row" style="justify-content:space-between"><h3>ACTIVITY & ERROR LOG</h3><button class="btn" id="exportLogs" type="button">EXPORT DEBUG JSON</button></div><div class="logs" id="logs"><div class="hint">No events yet.</div></div></section>
-</div><p class="footer">NEXUS records actual browser events. Website behavior, login state and network conditions can affect replay results.</p></div>
-<div class="modal" id="keyModal"><div class="dialog"><h2>Secure access</h2><p class="muted">Enter the NEXUS_ACCESS_KEY configured in your server environment.</p><input class="field" id="key" type="password" placeholder="Access key"><div class="error" id="keyError"></div><div class="row" style="margin-top:12px"><button class="btn primary" id="connect">CONNECT</button></div></div></div>
+:root{color-scheme:dark;--bg:#07101e;--panel:#0f1c2e;--card:#111f33;--line:#1e3250;--muted:#7a93b4;--text:#ddeeff;--green:#3ecf8e;--red:#ff6b81;--amber:#f5c46a;--blue:#5b9cf6;--accent:#1e3a5f}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:13px/1.5 system-ui,sans-serif;min-height:100vh}
+.wrap{width:min(1060px,100% - 24px);margin:0 auto;padding:22px 0 60px}
+
+/* TOP BAR */
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;gap:12px;flex-wrap:wrap}
+.brand{display:flex;gap:11px;align-items:center}
+.logo{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:#0d2b26;color:var(--green);font-weight:900;font-size:21px;border:1px solid #1a5a4a;flex-shrink:0}
+.brand-text h1{font-size:18px;letter-spacing:.12em;line-height:1.1}
+.brand-text small{color:var(--muted);font-size:11px}
+.pill{border:1px solid var(--line);border-radius:30px;padding:6px 12px;color:var(--muted);font-size:11px;display:flex;align-items:center;gap:7px;white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:#3c5572;flex-shrink:0;transition:background .3s}
+.dot.READY,.dot.REPLAYING{background:var(--green);box-shadow:0 0 8px var(--green)}
+.dot.ERROR{background:var(--red)}
+.dot.STARTING{background:var(--amber)}
+#statusText{font-weight:700}
+
+/* PAGE STATUS BAR */
+.pagebar{background:var(--accent);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-height:40px}
+.pagebar-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;flex-shrink:0}
+.pagebar-url{font-size:12px;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.pagebar-title{font-size:11px;color:var(--muted);flex-shrink:0;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav-event{font-size:10px;padding:2px 8px;border-radius:20px;border:1px solid var(--line);flex-shrink:0}
+.nav-event.changed{border-color:var(--green);color:var(--green)}
+
+/* TABS */
+.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--line);padding-bottom:0;overflow-x:auto}
+.tab{background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);padding:10px 16px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;letter-spacing:.04em;transition:color .15s,border-color .15s}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--green);border-bottom-color:var(--green)}
+
+/* CARDS */
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:14px}
+.card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;gap:8px}
+.card-head h3{font-size:12px;letter-spacing:.06em;color:var(--muted);text-transform:uppercase}
+.hint{color:var(--muted);font-size:11px;line-height:1.5;margin-bottom:12px}
+.error-line{color:var(--red);font-size:12px;min-height:18px;margin-top:8px}
+
+/* INPUTS */
+.field{width:100%;background:#06111f;border:1px solid #223450;border-radius:9px;color:var(--text);padding:11px 13px;font-size:13px;outline:none}
+.field:focus{border-color:var(--green)}
+label.lbl{display:block;font-size:11px;color:var(--muted);margin:10px 0 5px;letter-spacing:.04em}
+
+/* BUTTONS */
+.btn{border:1px solid var(--line);border-radius:9px;background:#152338;color:var(--text);padding:10px 16px;font-size:12px;font-weight:700;cursor:pointer;transition:opacity .15s,background .15s;white-space:nowrap}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.green{background:#0d3328;border-color:#1a7055;color:var(--green)}
+.btn.green:hover:not(:disabled){background:#0f4030}
+.btn.red{background:#3b1621;border-color:#7a2d3c;color:var(--red)}
+.btn.red:hover:not(:disabled){background:#4a1e28}
+.btn.blue{background:#0e2040;border-color:#2a4f8a;color:var(--blue)}
+.btn.blue:hover:not(:disabled){background:#132850}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+/* STATS */
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px}
+.stat{padding:12px;border:1px solid var(--line);border-radius:10px;background:#08121e}
+.stat small{display:block;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.stat strong{font-size:20px;font-weight:700}
+.stat strong.ok{color:var(--green)}
+.stat strong.err{color:var(--red)}
+.stat strong.info{color:var(--blue)}
+
+/* PROGRESS */
+.bar{height:5px;background:#172232;border-radius:10px;overflow:hidden;margin:12px 0}
+.bar>i{display:block;height:100%;width:0;background:var(--green);transition:width .3s}
+
+/* CURRENT ACTION */
+.current{background:#06111f;border:1px solid #1a2f4a;border-radius:9px;padding:12px;font:11px/1.5 ui-monospace,monospace;color:#8ecfaa;min-height:48px;overflow-wrap:anywhere}
+
+/* FILE DROP */
+.filebox{border:1px dashed #2a4060;background:#060f1c;border-radius:11px;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer}
+.filebox input[type=file]{max-width:100%;color:var(--muted);font-size:12px}
+.fileinfo{font-size:11px;color:var(--muted);margin-top:8px;overflow-wrap:anywhere}
+
+/* ACTION TABLE */
+.proof-table{width:100%;border-collapse:collapse;font-size:11px}
+.proof-table th{color:var(--muted);padding:8px 6px;text-align:left;font-weight:600;font-size:10px;letter-spacing:.05em;border-bottom:1px solid var(--line)}
+.proof-table td{padding:8px 6px;border-bottom:1px solid #111d2e;vertical-align:middle}
+.proof-table tr:last-child td{border-bottom:none}
+.ok{color:var(--green)}
+.warn{color:var(--amber)}
+.err{color:var(--red)}
+.badge{display:inline-block;padding:2px 7px;border-radius:20px;font-size:10px;font-weight:700;border:1px solid currentColor}
+.badge.ok{color:var(--green);border-color:#1a5a3a}
+.badge.warn{color:var(--amber);border-color:#5a4010}
+.badge.err{color:var(--red);border-color:#5a2030}
+
+/* INSPECT */
+.inspect-report{display:grid;gap:7px}
+.inspect-item{background:#06111f;border:1px solid var(--line);border-radius:9px;padding:10px 12px}
+.inspect-item b{font-size:12px}
+.inspect-item small{display:block;color:var(--muted);font-size:10px;margin-top:3px}
+.inspect-item.unique{border-color:#1a5a3a}
+.inspect-item.ambig{border-color:#5a4010}
+.inspect-item.none{border-color:#5a2030}
+
+/* DIAG */
+.diag{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.check{border:1px solid var(--line);border-radius:9px;padding:10px}
+.check b{font-size:11px}
+.check small{display:block;color:var(--muted);font-size:10px;overflow-wrap:anywhere;margin-top:2px}
+
+/* LOGS */
+.logs{max-height:380px;overflow-y:auto;display:grid;gap:6px}
+.log{background:#06111f;border:1px solid #192840;border-radius:8px;padding:8px 11px;font:10px/1.4 ui-monospace,monospace;overflow-wrap:anywhere}
+.log time{color:#5a7a9a;display:block;margin-bottom:2px}
+.log.ERROR,.log.FAILED{border-color:#4a2030;background:#0d0a10}
+
+/* MODAL */
+.modal{position:fixed;inset:0;background:#020811dd;display:none;place-items:center;padding:16px;z-index:9999}
+.modal.show{display:grid}
+.dialog{width:min(400px,100%);background:#112235;border:1px solid #2a4060;border-radius:14px;padding:22px}
+.dialog h2{margin-bottom:8px;font-size:16px}
+
+/* VIEWS */
+.view{display:none}
+.view.active{display:block}
+
+/* EMPTY */
+.empty{color:var(--muted);font-size:12px;text-align:center;padding:28px 0}
+
+/* workflow preview */
+.action-list{max-height:260px;overflow-y:auto;display:grid;gap:5px;margin-top:10px}
+.action-row{background:#06111f;border:1px solid var(--line);border-radius:8px;padding:8px 11px;display:flex;align-items:center;gap:10px}
+.action-num{font-size:10px;color:var(--muted);width:28px;flex-shrink:0}
+.action-info{flex:1;min-width:0}
+.action-info b{font-size:11px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.action-info small{color:var(--muted);font-size:10px}
+.action-gap{font-size:10px;color:var(--muted);flex-shrink:0}
+
+@media(max-width:680px){
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .diag{grid-template-columns:1fr}
+  .row{flex-direction:column;align-items:stretch}
+  .row .btn{text-align:center}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">N</div>
+    <div class="brand-text">
+      <h1>NEXUS</h1>
+      <small>AI-Powered Browser Automation &amp; Replay System · v2.2</small>
+    </div>
+  </div>
+  <div class="pill">
+    <span class="dot" id="dot"></span>
+    <span id="statusText">DISCONNECTED</span>
+  </div>
+</header>
+
+<!-- PAGE STATUS BAR -->
+<div class="pagebar" id="pagebar">
+  <span class="pagebar-label">Page</span>
+  <span class="pagebar-url" id="pagebarUrl">No page open</span>
+  <span class="pagebar-title" id="pagebarTitle"></span>
+  <span class="nav-event" id="navEvent" style="display:none"></span>
+</div>
+
+<!-- TABS -->
+<nav class="tabs">
+  <button class="tab active" data-tab="browserView">Browser</button>
+  <button class="tab" data-tab="workflowView">Workflow</button>
+  <button class="tab" data-tab="replayView">Replay</button>
+  <button class="tab" data-tab="diagnosticsView">Diagnostics</button>
+  <button class="tab" data-tab="logsView">Activity &amp; Logs</button>
+</nav>
+
+<!-- BROWSER TAB -->
+<div class="view active" id="browserView">
+  <div class="card">
+    <div class="card-head"><h3>Browser Session</h3></div>
+    <p class="hint">Enter the destination URL. NEXUS opens a real Chromium browser and waits for your recorded JSON workflow. The page must match the origin of your recording.</p>
+    <label class="lbl" for="urlInput">WEBSITE URL</label>
+    <div class="row">
+      <input class="field" id="urlInput" type="url" placeholder="https://example.com" style="flex:1">
+      <button class="btn green" id="openBtn">OPEN PAGE</button>
+      <button class="btn red" id="stopBtn">STOP</button>
+    </div>
+    <div class="error-line" id="browserError"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>Live Browser Status</h3></div>
+    <div class="current" id="currentAction">Waiting for website and workflow.</div>
+    <div class="bar"><i id="mainProgress"></i></div>
+    <div class="row" style="margin-top:12px">
+      <div style="flex:1;font-size:11px;color:var(--muted)">Actions: <strong id="inlineDone">0</strong> / <strong id="inlineTotal">0</strong></div>
+      <div style="font-size:11px;color:var(--muted)">Elapsed: <strong id="inlineElapsed">—</strong> ms</div>
+    </div>
+  </div>
+</div>
+
+<!-- WORKFLOW TAB -->
+<div class="view" id="workflowView">
+  <div class="card">
+    <div class="card-head"><h3>Load JSON Recording</h3></div>
+    <p class="hint">Upload the JSON exported by NEXUS Recorder V3.2.2. Schema: <code>nexus-click-v1</code>. Compatible with PEI v3.2 fingerprints and all selector candidates.</p>
+    <div class="filebox">
+      <input id="fileInput" type="file" accept=".json,application/json">
+      <button class="btn" id="clearWorkflow">CLEAR</button>
+    </div>
+    <div class="fileinfo" id="fileinfo">No JSON loaded.</div>
+  </div>
+
+  <div class="card" id="workflowPreviewCard" style="display:none">
+    <div class="card-head">
+      <h3>Workflow Actions</h3>
+      <span style="font-size:11px;color:var(--green)" id="workflowCount">0 actions</span>
+    </div>
+    <div class="row" style="margin-bottom:12px">
+      <button class="btn blue" id="inspectBtn" disabled>⌕ INSPECT ELEMENTS</button>
+      <button class="btn green" id="startReplayBtn" disabled>▶ START REPLAY</button>
+      <button class="btn red" id="haltBtn" disabled>■ STOP REPLAY</button>
+    </div>
+    <div class="action-list" id="actionList"></div>
+  </div>
+
+  <div class="card" id="inspectCard" style="display:none">
+    <div class="card-head"><h3>Element Inspector</h3></div>
+    <p class="hint">Each recorded action is checked against the live page. Unique targets are outlined in green. Duplicate or ambiguous targets are reported without guessing.</p>
+    <div class="inspect-report" id="inspectReport"><div class="empty">Run inspection to see results.</div></div>
+  </div>
+</div>
+
+<!-- REPLAY TAB -->
+<div class="view" id="replayView">
+  <div class="card">
+    <div class="card-head"><h3>Execution Counters</h3></div>
+    <div class="stats">
+      <div class="stat"><small>Workflow Actions</small><strong class="info" id="statTotal">0</strong></div>
+      <div class="stat"><small>Completed</small><strong id="statDone">0</strong></div>
+      <div class="stat"><small>Click Dispatched</small><strong class="ok" id="statSuccess">0</strong></div>
+      <div class="stat"><small>Response Signals</small><strong class="ok" id="statVerified">0</strong></div>
+      <div class="stat"><small>Failed</small><strong class="err" id="statFailed">0</strong></div>
+    </div>
+    <div class="bar"><i id="replayProgress"></i></div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px" id="replayElapsed">Elapsed: —</div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>Action-by-Action Proof</h3></div>
+    <p class="hint">Detection, dispatch, and observable page response are three separate facts. A dispatched click is not proof that the website completed its operation.</p>
+    <div style="overflow-x:auto">
+      <table class="proof-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Target Element</th>
+            <th>Detected</th>
+            <th>Click</th>
+            <th>Page Response</th>
+            <th>URL After</th>
+            <th>Time</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="proofRows"><tr><td colspan="8" class="empty">Start replay to see per-action evidence.</td></tr></tbody>
+      </table>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:10px" id="proofRunTime">—</div>
+  </div>
+</div>
+
+<!-- DIAGNOSTICS TAB -->
+<div class="view" id="diagnosticsView">
+  <div class="card">
+    <div class="card-head">
+      <h3>Browser Diagnostics</h3>
+      <button class="btn" id="refreshDiag">REFRESH</button>
+    </div>
+    <div class="diag" id="diagGrid"><div class="empty">Open a website to collect diagnostics.</div></div>
+  </div>
+</div>
+
+<!-- LOGS TAB -->
+<div class="view" id="logsView">
+  <div class="card">
+    <div class="card-head">
+      <h3>Activity &amp; Error Log</h3>
+      <button class="btn" id="exportLogsBtn">EXPORT DEBUG JSON</button>
+    </div>
+    <div class="logs" id="logsContainer"><div class="empty">No events yet.</div></div>
+  </div>
+</div>
+
+</div><!-- /wrap -->
+
+<!-- ACCESS KEY MODAL -->
+<div class="modal" id="keyModal">
+  <div class="dialog">
+    <h2>Secure Access</h2>
+    <p class="hint" style="margin:8px 0 14px">Enter the NEXUS_ACCESS_KEY configured in your server environment.</p>
+    <input class="field" id="keyInput" type="password" placeholder="Access key">
+    <div class="error-line" id="keyError"></div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn green" id="connectBtn" style="flex:1">CONNECT</button>
+    </div>
+  </div>
+</div>
+
 <script>
-const $=id=>document.getElementById(id);let key=sessionStorage.getItem('nexus_key')||'',workflow=null,polling=false;
-const api=(path,opts={})=>fetch(path,{...opts,headers:{'Content-Type':'application/json','X-Nexus-Key':key,...(opts.headers||{})}}).then(async r=>{const d=await r.json().catch(()=>({detail:'Invalid response'}));if(!r.ok)throw Error(d.detail||`HTTP ${r.status}`);return d});
-function showError(s){$('error').textContent=s||''}
-function escapeHtml(s){return String(s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]))}
-function setStatus(s){$('status').textContent=s;$('dot').className='dot '+s}
-function render(d){window.nexusLastSession=d.session_id;window.nexusLastActivity=d.activity||[];window.nexusLastResults=d.action_results||[];setStatus(d.status||'UNKNOWN');$('total').textContent=d.actions_total||0;$('done').textContent=d.actions_done||0;$('success').textContent=d.success||0;$('failed').textContent=d.failed||0;$('verified').textContent=d.verified||0;$('runTime').textContent='Elapsed: '+(d.run_elapsed_ms??'—')+' ms';$('actionRows').innerHTML=(d.action_results||[]).map(a=>`<tr style="border-top:1px solid #263750"><td style="padding:8px">${a.number}</td><td>${escapeHtml(a.target||'')}</td><td class="${a.detected?'ok':'warn'}">${a.detected?'YES':'NO'}</td><td class="${a.dispatched?'ok':'warn'}">${a.dispatched?'DISPATCHED':'—'}</td><td class="${a.response_observed?'ok':'warn'}">${a.response_observed?'OBSERVED':'NOT PROVEN'}</td><td>${a.elapsed_ms??'—'} ms</td><td>${escapeHtml(a.status||'')}</td></tr>`).join('')||'<tr><td colspan="7" class="hint">No actions processed yet.</td></tr>';$('progress').style.width=(d.actions_total?100*(d.actions_done||0)/d.actions_total:0)+'%';$('current').textContent=d.current_action?`Processing recorded action ${d.current_action} / ${d.actions_total||0} · ${d.action_results?.at(-1)?.status||'STARTING'} · ${d.action_results?.at(-1)?.target||''}`:(d.message||'Idle');$('stop').disabled=!['READY','REPLAYING','STARTING'].includes(d.status);$('halt').disabled=!d.replay_running;$('replay').disabled=!workflow||d.status!=='READY';$('diagnostics').innerHTML=(d.diagnostics?.checks||[]).map(c=>`<div class="check"><b class="${c.status==='ok'?'ok':c.status==='warning'?'warn':''}">${c.name}</b><small>${c.detail}</small></div>`).join('')||'<div class="hint">Diagnostics appear after page load.</div>';$('logs').innerHTML=(d.activity||[]).slice().reverse().map(x=>`<div class="log"><time>${x.time} · ${x.event_type} · ${x.status}</time>${x.message}</div>`).join('')||'<div class="hint">No events yet.</div>'}
-async function refresh(){if(!key||polling)return;polling=true;try{render(await api('/api/data'))}catch(e){if(e.message.includes('Access key'))$('keyModal').classList.add('show');else showError(e.message)}finally{polling=false}}
-$('connect').onclick=async()=>{key=$('key').value.trim();try{await api('/api/data');sessionStorage.setItem('nexus_key',key);$('keyModal').classList.remove('show');refresh()}catch(e){$('keyError').textContent=e.message}};
-$('open').onclick=async()=>{const url=$('url').value.trim();if(!url)return showError('Enter a website URL.');$('open').disabled=true;showError('');setStatus('STARTING');try{const d=await api('/api/start',{method:'POST',body:JSON.stringify({url})});$('current').textContent=d.message;await refresh()}catch(e){showError(e.message);setStatus('ERROR')}finally{$('open').disabled=false}};
-$('file').onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const data=JSON.parse(await f.text());if(!data||!Array.isArray(data.actions)||!data.actions.length)throw Error('JSON must contain a non-empty actions array.');if(data.actions.length>5000)throw Error('Maximum 5,000 actions per workflow.');if(!data.actions.every(a=>a&&typeof a==='object'&&a.type==='click'&&a.target&&typeof a.target==='object'))throw Error('Unsupported recording format: expected click actions with target fingerprints.');workflow=data;$('fileinfo').textContent=`${f.name} · ${data.actions.length} recorded actions`;$('total').textContent=data.actions.length;$('replay').disabled=false;$('inspect').disabled=false;$('current').textContent='Workflow validated. Open an authorized test website, inspect targets, then replay.'}catch(err){workflow=null;$('fileinfo').textContent='Import failed: '+err.message;$('replay').disabled=true;$('inspect').disabled=true}e.target.value=''};
-$('clear').onclick=()=>{workflow=null;$('fileinfo').textContent='No JSON loaded.';$('replay').disabled=true;$('inspect').disabled=true;$('total').textContent='0'};
-$('inspect').onclick=async()=>{if(!workflow)return;$('inspect').disabled=true;$('inspectResults').textContent='Inspecting selectors and duplicate candidates…';try{const d=await api('/api/inspect',{method:'POST',body:JSON.stringify(workflow)});$('inspectResults').innerHTML=d.inspection.map(x=>`<div class="check"><b>Action ${x.number}: ${escapeHtml(x.label)}</b><small>${escapeHtml(x.message)} · ${x.candidate_count} matches · ${x.visible_enabled_count} visible/enabled</small>${x.candidates.map(c=>`<small>Frame ${c.frame} · ${escapeHtml(c.tag)} · ${c.visible?'visible':'hidden'} · ${c.disabled?'disabled':'enabled'} · ${escapeHtml(c.text||c.id||c.selector)}</small>`).join('')}</div>`).join('')||'No targets found.'}catch(e){$('inspectResults').textContent=e.message}finally{$('inspect').disabled=!workflow}};
-$('replay').onclick=async()=>{if(!workflow)return;try{await api('/api/replay',{method:'POST',body:JSON.stringify(workflow)});await refresh()}catch(e){showError(e.message)}};
-$('exportLogs').onclick=()=>{const payload={exported_at:new Date().toISOString(),session_id:window.nexusLastSession||null,activity:window.nexusLastActivity||[],action_results:window.nexusLastResults||[]};const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download='nexus-debug-'+Date.now()+'.json';a.click();URL.revokeObjectURL(u)};
-$('halt').onclick=async()=>{try{await api('/api/stop',{method:'POST'});await refresh()}catch(e){showError(e.message)}};
-$('stop').onclick=async()=>{try{await api('/api/stop',{method:'POST'});await refresh()}catch(e){showError(e.message)}};
-if(key)refresh();else $('keyModal').classList.add('show');setInterval(refresh,1200);
-</script></body></html>
+const $=id=>document.getElementById(id);
+let key=sessionStorage.getItem('nexus_key')||'',workflow=null,polling=false;
+let lastData=null,prevUrl='',prevTitle='';
+
+const api=(path,opts={})=>fetch(path,{...opts,headers:{'Content-Type':'application/json','X-Nexus-Key':key,...(opts.headers||{})}}).then(async r=>{
+  const d=await r.json().catch(()=>({detail:'Invalid response'}));
+  if(!r.ok)throw Error(d.detail||`HTTP ${r.status}`);
+  return d;
+});
+
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+// TABS
+document.querySelectorAll('.tab').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+    btn.classList.add('active');
+    $(btn.dataset.tab).classList.add('active');
+  });
+});
+
+function setStatus(s){
+  $('statusText').textContent=s;
+  $('dot').className='dot '+s;
+}
+
+function updatePageBar(d){
+  const url=d.url||'';
+  const title=d.title||'';
+  if(url){
+    $('pagebarUrl').textContent=url;
+    $('pagebarTitle').textContent=title?`· ${title}`:'';
+  } else {
+    $('pagebarUrl').textContent='No page open';
+    $('pagebarTitle').textContent='';
+  }
+  // nav event detection
+  const ev=$('navEvent');
+  if(url&&url!==prevUrl&&prevUrl){
+    ev.textContent='Page changed ✓';
+    ev.className='nav-event changed';
+    ev.style.display='';
+    setTimeout(()=>{ev.style.display='none'},3500);
+  }
+  prevUrl=url;prevTitle=title;
+}
+
+function renderStats(d){
+  $('statTotal').textContent=d.actions_total||0;
+  $('statDone').textContent=d.actions_done||0;
+  $('statSuccess').textContent=d.success||0;
+  $('statVerified').textContent=d.verified||0;
+  $('statFailed').textContent=d.failed||0;
+  const pct=d.actions_total?100*(d.actions_done||0)/d.actions_total:0;
+  $('replayProgress').style.width=pct+'%';
+  $('mainProgress').style.width=pct+'%';
+  $('replayElapsed').textContent='Elapsed: '+(d.run_elapsed_ms??'—')+' ms';
+  $('inlineDone').textContent=d.actions_done||0;
+  $('inlineTotal').textContent=d.actions_total||0;
+  $('inlineElapsed').textContent=d.run_elapsed_ms??'—';
+}
+
+function renderProof(results){
+  if(!results||!results.length){
+    $('proofRows').innerHTML='<tr><td colspan="8" class="empty">No actions processed yet.</td></tr>';
+    return;
+  }
+  $('proofRows').innerHTML=results.map(a=>{
+    const detBadge=a.detected?'<span class="badge ok">YES</span>':'<span class="badge warn">NO</span>';
+    const clickBadge=a.dispatched?'<span class="badge ok">SENT</span>':'<span class="badge warn">—</span>';
+    const respBadge=a.response_observed?'<span class="badge ok">OBSERVED</span>':'<span class="badge warn">NONE</span>';
+    const afterUrl=a.after_url?`<span title="${esc(a.after_url)}" style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;font-size:10px;color:var(--muted)">${esc((a.after_url||'').replace(/^https?:\/\//,'').slice(0,32))}</span>`:'—';
+    const statusClass=a.status==='RESPONSE_OBSERVED'?'ok':a.status&&a.status.startsWith('FAILED')?'err':'warn';
+    return `<tr>
+      <td style="color:var(--muted);font-size:10px">${a.number}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(a.target)}">${esc(a.target||'')}</td>
+      <td>${detBadge}</td>
+      <td>${clickBadge}</td>
+      <td>${respBadge}</td>
+      <td>${afterUrl}</td>
+      <td style="color:var(--muted);font-size:10px">${a.elapsed_ms??'—'} ms</td>
+      <td><span class="${statusClass}" style="font-size:10px">${esc(a.status||'')}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderCurrent(d){
+  const ca=d.current_action;
+  const last=(d.action_results||[]).at(-1);
+  if(ca){
+    $('currentAction').textContent=`Action ${ca} / ${d.actions_total||0} · ${last?.status||'STARTING'} · ${last?.target||''}`;
+  } else {
+    $('currentAction').textContent=d.message||'Idle';
+  }
+}
+
+function renderDiag(d){
+  const checks=(d.diagnostics?.checks||[]);
+  if(!checks.length){$('diagGrid').innerHTML='<div class="empty">Open a website to collect diagnostics.</div>';return}
+  $('diagGrid').innerHTML=checks.map(c=>`<div class="check"><b class="${c.status==='ok'?'ok':c.status==='warning'?'warn':''}">${esc(c.name)}</b><small>${esc(c.detail)}</small></div>`).join('');
+}
+
+function renderLogs(activity){
+  if(!activity||!activity.length){$('logsContainer').innerHTML='<div class="empty">No events yet.</div>';return}
+  $('logsContainer').innerHTML=[...activity].reverse().map(x=>`<div class="log ${x.level||''}"><time>${esc(x.time)} · ${esc(x.event_type)} · ${esc(x.status)}</time>${esc(x.message)}</div>`).join('');
+}
+
+function renderButtons(d){
+  $('openBtn').disabled=['STARTING','REPLAYING'].includes(d.status);
+  $('stopBtn').disabled=!['READY','REPLAYING','STARTING'].includes(d.status);
+  $('startReplayBtn').disabled=!workflow||d.status!=='READY';
+  $('haltBtn').disabled=!d.replay_running;
+  $('inspectBtn').disabled=!workflow||!['READY','REPLAYING'].includes(d.status);
+}
+
+function render(d){
+  lastData=d;
+  setStatus(d.status||'UNKNOWN');
+  updatePageBar(d);
+  renderStats(d);
+  renderProof(d.action_results||[]);
+  renderCurrent(d);
+  renderDiag(d);
+  renderLogs(d.activity||[]);
+  renderButtons(d);
+  if(d.run_elapsed_ms!=null)$('proofRunTime').textContent='Total elapsed: '+(d.run_elapsed_ms)+' ms';
+}
+
+async function refresh(){
+  if(!key||polling)return;
+  polling=true;
+  try{render(await api('/api/data'))}
+  catch(e){
+    if(e.message.includes('Access key')||e.message.includes('401'))$('keyModal').classList.add('show');
+    else $('browserError').textContent=e.message;
+  }finally{polling=false}
+}
+
+// ACCESS KEY
+$('connectBtn').onclick=async()=>{
+  key=$('keyInput').value.trim();
+  try{await api('/api/data');sessionStorage.setItem('nexus_key',key);$('keyModal').classList.remove('show');refresh()}
+  catch(e){$('keyError').textContent=e.message}
+};
+
+// OPEN PAGE
+$('openBtn').onclick=async()=>{
+  const url=$('urlInput').value.trim();
+  if(!url){$('browserError').textContent='Enter a URL.';return}
+  $('openBtn').disabled=true;$('browserError').textContent='';
+  setStatus('STARTING');
+  try{
+    const d=await api('/api/start',{method:'POST',body:JSON.stringify({url})});
+    $('currentAction').textContent=d.message;
+    await refresh();
+  }catch(e){$('browserError').textContent=e.message;setStatus('ERROR')}
+  finally{$('openBtn').disabled=false}
+};
+
+// STOP
+$('stopBtn').onclick=async()=>{
+  try{await api('/api/stop',{method:'POST'});await refresh()}
+  catch(e){$('browserError').textContent=e.message}
+};
+
+// FILE LOAD
+$('fileInput').onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  try{
+    const data=JSON.parse(await f.text());
+    if(!data||!Array.isArray(data.actions)||!data.actions.length)throw Error('JSON must contain a non-empty actions array.');
+    if(data.actions.length>5000)throw Error('Max 5,000 actions per workflow.');
+    if(!data.actions.every(a=>a&&typeof a==='object'&&a.type==='click'&&a.target&&typeof a.target==='object'))
+      throw Error('Unsupported format: expected click actions with target fingerprints.');
+    workflow=data;
+    $('fileinfo').textContent=`${f.name} · ${data.actions.length} actions · schema: ${data.schema||'nexus-click-v1'} · recorded on ${data.source?.origin||'unknown origin'}`;
+    $('workflowCount').textContent=`${data.actions.length} actions`;
+    renderWorkflowPreview(data.actions);
+    $('workflowPreviewCard').style.display='';
+    $('startReplayBtn').disabled=false;
+    $('inspectBtn').disabled=!['READY','REPLAYING'].includes(lastData?.status);
+  }catch(err){
+    workflow=null;
+    $('fileinfo').textContent='Import failed: '+err.message;
+    $('workflowPreviewCard').style.display='none';
+  }
+  e.target.value='';
+};
+
+function renderWorkflowPreview(actions){
+  $('actionList').innerHTML=actions.map((a,i)=>{
+    const t=a.target||{};
+    const label=t.text||t.attrs?.['aria-label']||t.attrs?.['data-testid']||t.role||t.tag||'unknown';
+    const sel=(t.uniqueSelector||t.selectorCandidates?.[0]||t.cssPath||'no selector').slice(0,60);
+    const gap=a.gapMs?`+${a.gapMs}ms`:'';
+    return `<div class="action-row">
+      <span class="action-num">${i+1}</span>
+      <div class="action-info"><b>${esc(label)}</b><small>${esc(sel)}</small></div>
+      <span class="action-gap">${esc(gap)}</span>
+    </div>`;
+  }).join('');
+}
+
+$('clearWorkflow').onclick=()=>{
+  workflow=null;$('fileinfo').textContent='No JSON loaded.';
+  $('workflowPreviewCard').style.display='none';
+  $('inspectCard').style.display='none';
+  $('statTotal').textContent='0';
+};
+
+// INSPECT
+$('inspectBtn').onclick=async()=>{
+  if(!workflow)return;
+  $('inspectBtn').disabled=true;
+  $('inspectCard').style.display='';
+  $('inspectReport').innerHTML='<div class="empty">Inspecting selectors on live page…</div>';
+  try{
+    const d=await api('/api/inspect',{method:'POST',body:JSON.stringify(workflow)});
+    $('inspectReport').innerHTML=d.inspection.map(x=>{
+      const cls=x.unique_target?'unique':x.visible_enabled_count===0?'none':'ambig';
+      const icon=x.unique_target?'✓':x.visible_enabled_count===0?'✗':'⚠';
+      return `<div class="inspect-item ${cls}">
+        <b>${icon} Action ${x.number}: ${esc(x.label)}</b>
+        <small>${esc(x.message)} · ${x.candidate_count} matches · ${x.visible_enabled_count} visible/enabled</small>
+        ${x.candidates.map(c=>`<small style="color:var(--muted);display:block">Frame ${c.frame} · ${esc(c.tag)} · ${c.visible?'visible':'hidden'} · ${esc(c.text||c.id||'')}</small>`).join('')}
+      </div>`;
+    }).join('')||'<div class="empty">No targets found.</div>';
+  }catch(e){$('inspectReport').innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
+  finally{$('inspectBtn').disabled=!workflow}
+};
+
+// START REPLAY
+$('startReplayBtn').onclick=async()=>{
+  if(!workflow)return;
+  $('startReplayBtn').disabled=true;
+  $('browserError').textContent='';
+  try{
+    await api('/api/replay',{method:'POST',body:JSON.stringify(workflow)});
+    // switch to replay tab so user sees live progress
+    document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+    document.querySelector('[data-tab="replayView"]').classList.add('active');
+    $('replayView').classList.add('active');
+    await refresh();
+  }catch(e){$('browserError').textContent=e.message}
+  finally{$('startReplayBtn').disabled=!workflow||lastData?.status!=='READY'}
+};
+
+// HALT
+$('haltBtn').onclick=async()=>{
+  try{await api('/api/stop',{method:'POST'});await refresh()}
+  catch(e){$('browserError').textContent=e.message}
+};
+
+// REFRESH DIAG
+$('refreshDiag').onclick=async()=>{
+  try{const d=await api('/api/diagnostics');if(lastData)lastData.diagnostics=d;renderDiag({diagnostics:d})}
+  catch(e){$('browserError').textContent=e.message}
+};
+
+// EXPORT LOGS
+$('exportLogsBtn').onclick=()=>{
+  const payload={exported_at:new Date().toISOString(),session_id:lastData?.session_id||null,
+    activity:lastData?.activity||[],action_results:lastData?.action_results||[]};
+  const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+  const u=URL.createObjectURL(blob);const a=document.createElement('a');
+  a.href=u;a.download='nexus-debug-'+Date.now()+'.json';a.click();URL.revokeObjectURL(u);
+};
+
+// ENTER key on access key
+$('keyInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('connectBtn').click()});
+
+// BOOT
+if(key)refresh();else $('keyModal').classList.add('show');
+setInterval(refresh,1400);
+</script>
+</body>
+</html>
