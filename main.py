@@ -180,7 +180,7 @@ async def launch_browser(url: str) -> None:
 
 
 
-def is_linkvertise_page() -> bool:
+def is_goat_goates() -> bool:
     """Keep this build in inspection-only mode on Linkvertise/ad-gating pages."""
     try:
         host = (urlparse(page.url).hostname or "").lower() if page else ""
@@ -545,30 +545,7 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
     return {"ok":True,"status":"READY","message":"Website loaded."}
 
 
-@app.post("/api/inspect")
-async def inspect(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
-    require_key(x_nexus_key)
-    if page is None or page.is_closed() or state["status"] != "READY":
-        raise HTTPException(409, "Open an authorized test website before inspecting elements.")
-    if is_linkvertise_page():
-        raise HTTPException(403, "Element inspection is disabled on Linkvertise/ad-gating pages in this diagnostic build.")
-    reports = await inspect_workflow_targets(req.actions)
-    return {"ok": True, "inspection": reports}
 
-
-@app.post("/api/replay")
-async def replay(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
-    global replay_task
-    require_key(x_nexus_key)
-    if page is None or page.is_closed() or state["status"] not in ("READY",):
-        raise HTTPException(409,"Open a website before starting replay.")
-    if is_linkvertise_page():
-        raise HTTPException(403, "Replay is disabled on Linkvertise/ad-gating pages in this diagnostic build.")
-    if replay_task and not replay_task.done():
-        raise HTTPException(409,"Replay is already running.")
-    stop_event.clear()
-    replay_task = asyncio.create_task(run_replay(req.actions))
-    return {"ok":True,"status":"REPLAYING","actions":len(req.actions)}
 
 
 @app.post("/api/stop")
