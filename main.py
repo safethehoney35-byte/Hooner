@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from privacy_shield import PrivacyShield
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
 MAX_ACTIONS = 5000
 ELEMENT_DETECT_TIMEOUT = 3.0
@@ -180,26 +180,57 @@ async def launch_browser(url: str) -> None:
 
 
 
-def is_goat_goates() -> bool:
-    """Keep this build in inspection-only mode on Linkvertise/ad-gating pages."""
-    try:
-        host = (urlparse(page.url).hostname or "").lower() if page else ""
-        return host == "linkvertise.com" or host.endswith(".linkvertise.com")
-    except Exception:
-        return False
+
+
+
+def adapt_recorder_target(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize NEXUS Recorder 3.x nested target objects for the replay resolver.
+
+    Supports the legacy flat target shape and the recorder's PEI export shape
+    (attrs, selectorCandidates, uniqueSelector, cssPath, identity.fingerprint).
+    It never chooses an ordinal when selectors match multiple elements.
+    """
+    target = dict(raw or {})
+    attrs = target.get("attrs") if isinstance(target.get("attrs"), dict) else {}
+    target.setdefault("tag", target.get("tag"))
+    target.setdefault("id", attrs.get("id"))
+    target.setdefault("testId", attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa"))
+    target.setdefault("ariaLabel", attrs.get("aria-label"))
+    target.setdefault("name", attrs.get("name"))
+    target.setdefault("text", target.get("text") or "")
+    selectors = []
+    candidates = target.get("selectorCandidates")
+    if isinstance(candidates, list):
+        selectors.extend(str(x) for x in candidates if isinstance(x, str) and x.strip())
+    for key in ("uniqueSelector", "selector", "cssPath"):
+        value = target.get(key)
+        if isinstance(value, str) and value.strip():
+            selectors.append(value.strip())
+    if target.get("id"):
+        selectors.append("#" + str(target["id"]).replace('"', '\\"'))
+    if target.get("testId"):
+        selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\\"') + '"]')
+    if target.get("ariaLabel"):
+        selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\\"') + '"]')
+    if target.get("name"):
+        selectors.append('[name="' + str(target["name"]).replace('"', '\\"') + '"]')
+    target["_nexus_selectors"] = list(dict.fromkeys(selectors))
+    target["_nexus_attrs"] = attrs
+    return target
+
+
+def normalized_action(action: dict[str, Any]) -> dict[str, Any]:
+    item = dict(action)
+    item["target"] = adapt_recorder_target(item.get("target") or {})
+    return item
 
 
 async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
     """Inspect candidates without clicking. Reports duplicates across page frames."""
     reports = []
     for number, action in enumerate(actions, 1):
-        target = action.get("target") or {}
-        selectors = []
-        if target.get("selector"): selectors.append(str(target["selector"]))
-        if target.get("id"): selectors.append("#" + str(target["id"]).replace('"', '\\"'))
-        if target.get("testId"): selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\\"') + '"]')
-        if target.get("ariaLabel"): selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\\"') + '"]')
-        if target.get("name"): selectors.append('[name="' + str(target["name"]).replace('"', '\\"') + '"]')
+        target = adapt_recorder_target(action.get("target") or {})
+        selectors = target.get("_nexus_selectors", [])
         candidates, seen = [], set()
         for frame_index, frame in enumerate(page.frames):
             for selector in dict.fromkeys(selectors):
@@ -255,41 +286,52 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
     return reports
 
 def fingerprint_matches(el: dict, target: dict) -> bool:
-    for key, attr in (("tag","tag"),("id","id"),("testId","data-testid"),
-                      ("ariaLabel","aria-label"),("name","name")):
-        expected = target.get(key)
-        if expected and str(el.get(attr) or "").lower() != str(expected).lower(): return False
+    attrs = target.get("_nexus_attrs") if isinstance(target.get("_nexus_attrs"), dict) else {}
+    expected_fields = (
+        ("tag", target.get("tag")),
+        ("id", target.get("id") or attrs.get("id")),
+        ("testId", target.get("testId") or attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa")),
+        ("ariaLabel", target.get("ariaLabel") or attrs.get("aria-label")),
+        ("name", target.get("name") or attrs.get("name")),
+    )
+    for key, expected in expected_fields:
+        if expected and str(el.get(key) or "").strip().lower() != str(expected).strip().lower():
+            return False
     expected_text = " ".join(str(target.get("text") or "").split())
     actual_text = " ".join(str(el.get("text") or "").split())
-    if expected_text and expected_text not in actual_text: return False
+    if expected_text and expected_text not in actual_text:
+        return False
+    # Check extra recorded attributes when the live element exposes them.
+    for attr_name in ("type", "role", "placeholder", "title", "alt", "href"):
+        expected = attrs.get(attr_name)
+        actual = el.get("attrs", {}).get(attr_name)
+        if expected and actual is not None and str(expected).strip().lower() != str(actual).strip().lower():
+            return False
     return True
 
 
 async def resolve_target(action: dict):
-    target = action.get("target") or {}
-    selectors = []
-    if target.get("selector"): selectors.append(str(target["selector"]))
-    if target.get("id"): selectors.append("#" + str(target["id"]).replace('"', '\\"'))
-    if target.get("testId"): selectors.append('[data-testid="' + str(target["testId"]).replace('"','\\"') + '"]')
-    if target.get("ariaLabel"): selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"','\\"') + '"]')
-    if target.get("name"): selectors.append('[name="' + str(target["name"]).replace('"','\\"') + '"]')
-    for selector in dict.fromkeys(selectors):
+    target = adapt_recorder_target(action.get("target") or {})
+    selectors = target.get("_nexus_selectors", [])
+    for selector in selectors:
         try:
             loc = page.locator(selector)
             count = await loc.count()
-            if count == 1:
-                info = await loc.evaluate("""el=>({tag:el.tagName.toLowerCase(),id:el.id,
-                  testId:el.getAttribute('data-testid'),ariaLabel:el.getAttribute('aria-label'),
-                  name:el.getAttribute('name'),text:(el.innerText||el.textContent||el.value||'').replace(/\\s+/g,' ').trim(),
-                  visible:!!(el.getClientRects().length)&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).display!=='none',
-                  disabled:!!el.disabled||el.getAttribute('aria-disabled')==='true'})""")
-                if fingerprint_matches(info, target) and info["visible"] and not info["disabled"]:
-                    return loc, None
-            elif count > 1:
+            # Never guess between duplicates. A selector must identify one node.
+            if count != 1:
                 continue
+            info = await loc.evaluate("""el=>({tag:el.tagName.toLowerCase(),id:el.id||'',
+              testId:el.getAttribute('data-testid')||el.getAttribute('data-test')||el.getAttribute('data-qa')||'',
+              ariaLabel:el.getAttribute('aria-label')||'',name:el.getAttribute('name')||'',
+              text:(el.innerText||el.textContent||el.value||el.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim(),
+              attrs:Object.fromEntries(['type','role','placeholder','title','alt','href'].map(k=>[k,el.getAttribute(k)])),
+              visible:!!(el.getClientRects().length)&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).display!=='none'&&Number(getComputedStyle(el).opacity)!==0,
+              disabled:!!el.disabled||el.getAttribute('aria-disabled')==='true'})""")
+            if fingerprint_matches(info, target) and info["visible"] and not info["disabled"]:
+                return loc, None
         except Exception:
             continue
-    return None, "Target not present or fingerprint did not match"
+    return None, "No unique visible candidate matched the recorded PEI identity"
 
 
 async def execute_action(action: dict, number: int) -> tuple[bool, str]:
@@ -512,7 +554,7 @@ async def home():
 
 @app.get("/health")
 async def health():
-    return {"status":"healthy","app":"NEXUS Replay Engine","version":APP_VERSION,"browser_status":state["status"]}
+    return {"status":"healthy","app":"NEXUS Replay Engine","version":APP_VERSION,"recorder_compatibility":["nexus-recorder-3.x","pei-v3.2"],"browser_status":state["status"]}
 
 
 @app.get("/api/data")
@@ -546,6 +588,53 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
 
 
 
+
+
+@app.post("/api/inspect")
+async def inspect_workflow(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
+    """Inspect recorded click targets without dispatching any clicks."""
+    require_key(x_nexus_key)
+    if page is None or page.is_closed() or state["status"] not in ("READY", "REPLAYING"):
+        raise HTTPException(409, "Open a website before inspecting workflow targets.")
+    if state["replay_running"]:
+        raise HTTPException(409, "Cannot inspect while replay is running.")
+    for index, action in enumerate(req.actions, 1):
+        if not isinstance(action, dict) or action.get("type") != "click" or not isinstance(action.get("target"), dict):
+            raise HTTPException(422, f"Action {index} must be a click action with a target object.")
+    try:
+        reports = await inspect_workflow_targets([normalized_action(a) for a in req.actions])
+        return {"ok": True, "inspection": reports}
+    except Exception as exc:
+        add_log(f"Workflow inspection failed: {type(exc).__name__}: {str(exc)[:180]}",
+                "ERROR", event_type="WORKFLOW_INSPECT", status="FAILED")
+        raise HTTPException(500, "Workflow inspection failed. Check the activity log.")
+
+
+@app.post("/api/replay")
+async def replay(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
+    """Queue a validated click-only recording for sequential replay."""
+    global replay_task
+    require_key(x_nexus_key)
+    if page is None or page.is_closed() or state["status"] != "READY":
+        raise HTTPException(409, "Open a website and wait until it is READY before replaying.")
+    if replay_task and not replay_task.done():
+        raise HTTPException(409, "A replay is already running.")
+    current_origin = urlparse(page.url)
+    for index, action in enumerate(req.actions, 1):
+        if not isinstance(action, dict) or action.get("type") != "click" or not isinstance(action.get("target"), dict):
+            raise HTTPException(422, f"Action {index} must be a click action with a target object.")
+        recorded_url = action.get("url")
+        if recorded_url:
+            parsed = urlparse(str(recorded_url))
+            if parsed.scheme not in ("http", "https") or parsed.netloc != current_origin.netloc:
+                raise HTTPException(422, f"Action {index} was recorded on a different website origin.")
+    stop_event.clear()
+    replay_actions = [normalized_action(a) for a in req.actions]
+    replay_task = asyncio.create_task(run_replay(replay_actions), name="nexus-replay")
+    add_log(f"Replay queued: {len(req.actions)} validated click actions.",
+            event_type="REPLAY_QUEUED", status="RUNNING")
+    return {"ok": True, "status": "REPLAYING", "actions": len(req.actions),
+            "message": "Replay started in recorded order."}
 
 
 @app.post("/api/stop")
