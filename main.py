@@ -18,11 +18,10 @@ from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from privacy_shield import PrivacyShield
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
 MAX_ACTIONS = 5000
-ELEMENT_DETECT_TIMEOUT = 3.0
-ELEMENT_RETRY_INTERVAL = 0.15
+ELEMENT_RETRY_INTERVAL = 0.25  # event-friendly polling; target discovery has no fixed deadline
 LOG_LIMIT = 240
 HOST_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
 
@@ -184,28 +183,41 @@ async def launch_browser(url: str) -> None:
 
 
 def adapt_recorder_target(raw: dict[str, Any]) -> dict[str, Any]:
-    """Normalize NEXUS Recorder 3.x nested target objects for the replay resolver.
+    """Normalize NEXUS Recorder 3.x PEI targets without discarding nested identity.
 
-    Supports the legacy flat target shape and the recorder's PEI export shape
-    (attrs, selectorCandidates, uniqueSelector, cssPath, identity.fingerprint).
-    It never chooses an ordinal when selectors match multiple elements.
+    Recorder exports may have no uniqueSelector/selectorCandidates while still
+    carrying a usable cssPath and a full identity.fingerprint. Preserve both.
     """
     target = dict(raw or {})
+    identity = target.get("identity") if isinstance(target.get("identity"), dict) else {}
+    fingerprint = identity.get("fingerprint") if isinstance(identity.get("fingerprint"), dict) else {}
+    event_target = target.get("eventTarget") if isinstance(target.get("eventTarget"), dict) else {}
     attrs = target.get("attrs") if isinstance(target.get("attrs"), dict) else {}
-    target.setdefault("tag", target.get("tag"))
-    target.setdefault("id", attrs.get("id"))
-    target.setdefault("testId", attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa"))
-    target.setdefault("ariaLabel", attrs.get("aria-label"))
-    target.setdefault("name", attrs.get("name"))
-    target.setdefault("text", target.get("text") or "")
-    selectors = []
-    candidates = target.get("selectorCandidates")
-    if isinstance(candidates, list):
-        selectors.extend(str(x) for x in candidates if isinstance(x, str) and x.strip())
-    for key in ("uniqueSelector", "selector", "cssPath"):
-        value = target.get(key)
-        if isinstance(value, str) and value.strip():
-            selectors.append(value.strip())
+    fp_attrs = fingerprint.get("attrs") if isinstance(fingerprint.get("attrs"), dict) else {}
+    merged_attrs = {**fp_attrs, **attrs}
+
+    for key in ("tag", "role", "text", "context"):
+        if not target.get(key) and fingerprint.get(key) is not None:
+            target[key] = fingerprint[key]
+        if not target.get(key) and event_target.get(key) is not None:
+            target[key] = event_target[key]
+    target["attrs"] = merged_attrs
+    target["id"] = target.get("id") or merged_attrs.get("id")
+    target["testId"] = (target.get("testId") or merged_attrs.get("data-testid") or
+                        merged_attrs.get("data-test") or merged_attrs.get("data-qa"))
+    target["ariaLabel"] = target.get("ariaLabel") or merged_attrs.get("aria-label")
+    target["name"] = target.get("name") or merged_attrs.get("name")
+    target["text"] = target.get("text") or ""
+
+    selectors: list[str] = []
+    for source in (target, event_target):
+        candidates = source.get("selectorCandidates")
+        if isinstance(candidates, list):
+            selectors.extend(str(x).strip() for x in candidates if isinstance(x, str) and x.strip())
+        for key in ("uniqueSelector", "selector", "cssPath"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                selectors.append(value.strip())
     if target.get("id"):
         selectors.append("#" + str(target["id"]).replace('"', '\\"'))
     if target.get("testId"):
@@ -215,77 +227,77 @@ def adapt_recorder_target(raw: dict[str, Any]) -> dict[str, Any]:
     if target.get("name"):
         selectors.append('[name="' + str(target["name"]).replace('"', '\\"') + '"]')
     target["_nexus_selectors"] = list(dict.fromkeys(selectors))
-    target["_nexus_attrs"] = attrs
+    target["_nexus_attrs"] = merged_attrs
+    target["_nexus_identity"] = identity
     return target
 
 
-def normalized_action(action: dict[str, Any]) -> dict[str, Any]:
-    item = dict(action)
-    item["target"] = adapt_recorder_target(item.get("target") or {})
-    return item
+def _normal_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
 
 
 async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
-    """Inspect candidates without clicking. Reports duplicates across page frames."""
+    """Inspect recorded targets across all frames using the same resolver rules as replay."""
     reports = []
     for number, action in enumerate(actions, 1):
         target = adapt_recorder_target(action.get("target") or {})
         selectors = target.get("_nexus_selectors", [])
         candidates, seen = [], set()
-        for frame_index, frame in enumerate(page.frames):
-            for selector in dict.fromkeys(selectors):
+        for frame_index, frame in enumerate(list(page.frames)):
+            for selector in selectors:
                 try:
                     loc = frame.locator(selector)
-                    count = min(await loc.count(), 30)
+                    count = min(await loc.count(), 100)
                     for idx in range(count):
                         el = loc.nth(idx)
-                        info = await el.evaluate("""el => {
-                          const s=getComputedStyle(el), r=el.getBoundingClientRect();
-                          return {tag:el.tagName.toLowerCase(),id:el.id||'',testId:el.getAttribute('data-testid')||'',
-                            ariaLabel:el.getAttribute('aria-label')||'',name:el.getAttribute('name')||'',
-                            text:(el.innerText||el.textContent||el.value||'').replace(/\\s+/g,' ').trim().slice(0,120),
-                            visible:!!(el.getClientRects().length)&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0,
-                            disabled:!!el.disabled||el.getAttribute('aria-disabled')==='true'};
-                        }""")
-                        key = (frame_index, selector, idx, info.get("tag"), info.get("id"), info.get("text"))
-                        if key in seen: continue
+                        info = await _element_info(el)
+                        key = (frame_index, info.get("domPath"))
+                        if key in seen:
+                            continue
                         seen.add(key)
                         if fingerprint_matches(info, target):
-                            candidates.append({"frame":frame_index,"selector":selector,**info,"fingerprint_match":True})
+                            candidates.append({"frame": frame_index, "selector": selector, "index": idx,
+                                               **info, "fingerprint_match": True,
+                                               "context_score": _context_score(info, target)})
                 except Exception:
                     continue
         eligible = [c for c in candidates if c["visible"] and not c["disabled"]]
+        if len(eligible) > 1:
+            best_score = max(c["context_score"] for c in eligible)
+            best = [c for c in eligible if c["context_score"] == best_score]
+            if best_score > 0 and len(best) == 1:
+                eligible = best
         highlighted = False
         if len(eligible) == 1:
             c = eligible[0]
             try:
                 frame = page.frames[c["frame"]]
-                loc = frame.locator(c["selector"])
-                # Highlight only if this selector is unique in its frame.
-                if await loc.count() == 1:
-                    await loc.evaluate("""el => {
-                      el.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
-                      el.style.setProperty('outline','3px solid #22c55e','important');
-                      el.style.setProperty('outline-offset','3px','important');
-                    }""")
-                    highlighted = True
+                loc = frame.locator(c["selector"]).nth(c["index"])
+                await loc.evaluate("""el => {
+                  el.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
+                  el.style.setProperty('outline','3px solid #22c55e','important');
+                  el.style.setProperty('outline-offset','3px','important');
+                }""")
+                highlighted = True
             except Exception:
                 pass
         reports.append({
-            "number":number,
-            "label":str(target.get("text") or target.get("ariaLabel") or target.get("id") or target.get("selector") or target.get("tag") or "target")[:100],
-            "candidate_count":len(candidates),
-            "visible_enabled_count":len(eligible),
-            "unique_target":len(eligible)==1,
-            "highlighted":highlighted,
-            "candidates":candidates[:12],
-            "message":("Unique visible candidate highlighted" if highlighted else
-                       "No visible candidate" if not eligible else
-                       "Multiple visible candidates; no element highlighted")
+            "number": number,
+            "label": str(target.get("text") or target.get("ariaLabel") or target.get("id") or target.get("tag") or "target")[:100],
+            "candidate_count": len(candidates),
+            "visible_enabled_count": len(eligible),
+            "unique_target": len(eligible) == 1,
+            "highlighted": highlighted,
+            "candidates": [{k:v for k,v in c.items() if k not in ("index", "ancestors", "attrs")} for c in candidates[:12]],
+            "message": ("Unique visible candidate highlighted" if highlighted else
+                        "No visible candidate" if not eligible else
+                        "Multiple visible candidates; no element highlighted")
         })
     return reports
 
+
 def fingerprint_matches(el: dict, target: dict) -> bool:
+    """Hard-match stable recorded identity; use ancestor context to disambiguate."""
     attrs = target.get("_nexus_attrs") if isinstance(target.get("_nexus_attrs"), dict) else {}
     expected_fields = (
         ("tag", target.get("tag")),
@@ -293,45 +305,160 @@ def fingerprint_matches(el: dict, target: dict) -> bool:
         ("testId", target.get("testId") or attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa")),
         ("ariaLabel", target.get("ariaLabel") or attrs.get("aria-label")),
         ("name", target.get("name") or attrs.get("name")),
+        ("role", target.get("role") or attrs.get("role")),
     )
     for key, expected in expected_fields:
-        if expected and str(el.get(key) or "").strip().lower() != str(expected).strip().lower():
+        if expected and _normal_text(el.get(key)) != _normal_text(expected):
             return False
-    expected_text = " ".join(str(target.get("text") or "").split())
-    actual_text = " ".join(str(el.get("text") or "").split())
+
+    expected_text = _normal_text(target.get("text"))
+    actual_text = _normal_text(el.get("text"))
     if expected_text and expected_text not in actual_text:
         return False
-    # Check extra recorded attributes when the live element exposes them.
+
+    live_attrs = el.get("attrs") if isinstance(el.get("attrs"), dict) else {}
     for attr_name in ("type", "role", "placeholder", "title", "alt", "href"):
         expected = attrs.get(attr_name)
-        actual = el.get("attrs", {}).get(attr_name)
-        if expected and actual is not None and str(expected).strip().lower() != str(actual).strip().lower():
+        actual = live_attrs.get(attr_name)
+        if expected and actual is not None and _normal_text(expected) != _normal_text(actual):
+            return False
+    expected_class = set(str(attrs.get("class") or "").split())
+    actual_class = set(str(live_attrs.get("class") or "").split())
+    if expected_class and not expected_class.issubset(actual_class):
+        return False
+    expected_data = attrs.get("dataAttributes") if isinstance(attrs.get("dataAttributes"), dict) else {}
+    for key, value in expected_data.items():
+        if live_attrs.get("data-" + str(key).removeprefix("data-")) != value:
             return False
     return True
 
 
+def _context_score(el: dict, target: dict) -> int:
+    """Rank matching candidates by recorded ancestor chain; never use score alone to guess."""
+    expected_context = target.get("context") if isinstance(target.get("context"), dict) else {}
+    expected = expected_context.get("ancestors") if isinstance(expected_context.get("ancestors"), list) else []
+    actual = el.get("ancestors") if isinstance(el.get("ancestors"), list) else []
+    score = 0
+    for i, ancestor in enumerate(expected[:4]):
+        if i >= len(actual):
+            break
+        got = actual[i]
+        if ancestor.get("tag") and ancestor.get("tag") == got.get("tag"):
+            score += 3
+        if ancestor.get("id") and ancestor.get("id") == got.get("id"):
+            score += 12
+        # Compare short local ancestor text only; body/html text often changes due to UI chrome.
+        exp_text = _normal_text(ancestor.get("text"))
+        got_text = _normal_text(got.get("text"))
+        if exp_text and len(exp_text) <= 100 and exp_text == got_text:
+            score += 2
+    return score
+
+
+async def _element_info(locator):
+    return await locator.evaluate(r"""el=>{
+      const s=getComputedStyle(el);
+      const attrs={};
+      for(const a of Array.from(el.attributes||[])) attrs[a.name]=a.value;
+      const ancestors=[]; let p=el.parentElement;
+      const path=[]; let node=el;
+      while(node && node.nodeType===1){
+        const siblings=node.parentElement ? Array.from(node.parentElement.children).filter(x=>x.tagName===node.tagName) : [node];
+        path.unshift(node.tagName.toLowerCase()+':'+siblings.indexOf(node));
+        node=node.parentElement;
+      }
+      while(p && ancestors.length<6){
+        ancestors.push({tag:p.tagName.toLowerCase(),id:p.id||'',text:(p.innerText||p.textContent||'').replace(/\s+/g,' ').trim().slice(0,160)});
+        p=p.parentElement;
+      }
+      const implicitRole = el.getAttribute('role') || ({BUTTON:'button',A:'link',SELECT:'combobox',TEXTAREA:'textbox',INPUT:({button:'button',submit:'button',checkbox:'checkbox',radio:'radio',search:'searchbox',email:'textbox',text:'textbox',url:'textbox',tel:'textbox',number:'spinbutton'})[el.type]||'textbox'})[el.tagName] || '';
+      return {domPath:path.join('>'),tag:el.tagName.toLowerCase(),id:el.id||'',role:implicitRole,
+        testId:el.getAttribute('data-testid')||el.getAttribute('data-test')||el.getAttribute('data-qa')||'',
+        ariaLabel:el.getAttribute('aria-label')||'',name:el.getAttribute('name')||'',
+        text:(el.innerText||el.textContent||el.value||el.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim(),
+        attrs,ancestors,
+        visible:!!(el.getClientRects().length)&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0,
+        disabled:!!el.disabled||el.getAttribute('aria-disabled')==='true'};
+    }""")
+
+
 async def resolve_target(action: dict):
+    """Resolve the recorded identity in every frame; do not assume selector uniqueness."""
     target = adapt_recorder_target(action.get("target") or {})
     selectors = target.get("_nexus_selectors", [])
-    for selector in selectors:
-        try:
-            loc = page.locator(selector)
-            count = await loc.count()
-            # Never guess between duplicates. A selector must identify one node.
-            if count != 1:
+    if not selectors:
+        return None, "Recording contains no usable selector or CSS path"
+    matches = []
+    seen = set()
+    for frame_index, frame in enumerate(list(page.frames)):
+        for selector in selectors:
+            try:
+                loc = frame.locator(selector)
+                count = min(await loc.count(), 100)
+                for index in range(count):
+                    candidate = loc.nth(index)
+                    info = await _element_info(candidate)
+                    key = (frame_index, info.get("domPath"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if info.get("visible") and not info.get("disabled") and fingerprint_matches(info, target):
+                        matches.append((candidate, _context_score(info, target), frame_index, selector, info))
+            except Exception:
+                # A selector may be unsupported in a particular frame; try the next one.
                 continue
-            info = await loc.evaluate("""el=>({tag:el.tagName.toLowerCase(),id:el.id||'',
-              testId:el.getAttribute('data-testid')||el.getAttribute('data-test')||el.getAttribute('data-qa')||'',
-              ariaLabel:el.getAttribute('aria-label')||'',name:el.getAttribute('name')||'',
-              text:(el.innerText||el.textContent||el.value||el.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim(),
-              attrs:Object.fromEntries(['type','role','placeholder','title','alt','href'].map(k=>[k,el.getAttribute(k)])),
-              visible:!!(el.getClientRects().length)&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).display!=='none'&&Number(getComputedStyle(el).opacity)!==0,
-              disabled:!!el.disabled||el.getAttribute('aria-disabled')==='true'})""")
-            if fingerprint_matches(info, target) and info["visible"] and not info["disabled"]:
-                return loc, None
-        except Exception:
-            continue
-    return None, "No unique visible candidate matched the recorded PEI identity"
+    if not matches:
+        return None, "No visible, enabled element currently matches the recorded PEI identity"
+    # Deduplicate a node found through multiple equivalent selectors.
+    unique = {}
+    for item in matches:
+        loc, score, frame_index, selector, info = item
+        key = (frame_index, info.get("domPath"))
+        if key not in unique or score > unique[key][1]:
+            unique[key] = item
+    matches = list(unique.values())
+    if len(matches) == 1:
+        return matches[0][0], None
+    best_score = max(x[1] for x in matches)
+    best = [x for x in matches if x[1] == best_score]
+    if best_score > 0 and len(best) == 1:
+        return best[0][0], None
+    return None, f"Ambiguous recorded identity: {len(matches)} visible matching elements; refusing to guess"
+
+
+async def _wait_recorded_gap(action: dict) -> bool:
+    """Wait the exact recorded gap; return False if the user stops replay."""
+    raw = action.get("gapMs", 0)
+    try:
+        delay_ms = max(0, int(raw or 0))
+    except (TypeError, ValueError, OverflowError):
+        delay_ms = 0
+    if not delay_ms:
+        return not stop_event.is_set()
+    add_log(f"Respecting recorded inter-action gap: {delay_ms} ms.",
+            event_type="ACTION_WAIT", status="INFO")
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay_ms / 1000)
+        return False
+    except asyncio.TimeoutError:
+        return not stop_event.is_set()
+
+
+async def wait_for_recorded_target(action: dict):
+    """Wait indefinitely for the exact recorded target, until found or stopped."""
+    last_reason = "Target not present yet"
+    while not stop_event.is_set():
+        if page is None or page.is_closed():
+            return None, "Browser page closed while waiting for the recorded target"
+        locator, reason = await resolve_target(action)
+        if locator is not None:
+            return locator, None
+        last_reason = reason or last_reason
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=ELEMENT_RETRY_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+    return None, "Replay stopped while waiting for the recorded target: " + last_reason
 
 
 async def execute_action(action: dict, number: int) -> tuple[bool, str]:
@@ -342,27 +469,21 @@ async def execute_action(action: dict, number: int) -> tuple[bool, str]:
         try:
             expected = urlparse(action_url)
             current = urlparse(page.url)
-            if expected.scheme not in ("http","https") or expected.netloc != current.netloc:
+            if expected.scheme not in ("http", "https") or expected.netloc != current.netloc:
                 return False, "Recorded action origin does not match current page"
         except Exception:
             return False, "Invalid recorded action URL"
-    delay = min(max(int(action.get("gapMs") or 0), 0), 3000)
-    if delay: await asyncio.sleep(delay)
-    deadline = time.monotonic() + ELEMENT_DETECT_TIMEOUT
-    last_reason = "Target not present"
-    while time.monotonic() < deadline and not stop_event.is_set():
-        locator, reason = await resolve_target(action)
-        if locator is not None:
-            try:
-                await locator.scroll_into_view_if_needed(timeout=1500)
-                await locator.click(timeout=3500, no_wait_after=True)
-                return True, "Click dispatched"
-            except Exception as exc:
-                last_reason = str(exc).splitlines()[0][:180]
-        else:
-            last_reason = reason or last_reason
-        await asyncio.sleep(ELEMENT_RETRY_INTERVAL)
-    return False, "Timed out waiting for recorded target: " + last_reason
+    if not await _wait_recorded_gap(action):
+        return False, "Replay stopped during recorded gap"
+    locator, reason = await wait_for_recorded_target(action)
+    if locator is None:
+        return False, reason or "Replay stopped before target was found"
+    try:
+        await locator.scroll_into_view_if_needed(timeout=0)
+        await locator.click(timeout=0, no_wait_after=True)
+        return True, "Click dispatched to recorded target"
+    except Exception as exc:
+        return False, str(exc).splitlines()[0][:220]
 
 
 async def observe_page_response(before: dict[str, Any], wait_ms: int = 900) -> dict[str, Any]:
@@ -371,7 +492,12 @@ async def observe_page_response(before: dict[str, Any], wait_ms: int = 900) -> d
     This is evidence of a page response, not proof that the intended business
     operation completed. A mutation alone can be unrelated page activity.
     """
-    await asyncio.sleep(wait_ms / 1000)
+    # Yield once for the browser's microtask/MutationObserver queue; do not add
+    # a fixed post-click pacing delay to the recorded sequence.
+    if wait_ms > 0:
+        await asyncio.sleep(wait_ms / 1000)
+    else:
+        await asyncio.sleep(0)
     if page is None or page.is_closed():
         return {"observed": False, "signals": ["page_closed"]}
     try:
@@ -416,6 +542,17 @@ async def run_replay(actions: list[dict]) -> None:
     add_log(f"Replay started: {len(actions)} actions; strict recorded order enabled.",
             event_type="REPLAY_START", status="RUNNING")
     try:
+        # Recreate the page URL at the first recorded action, not merely the site root.
+        first_url = actions[0].get("url") if actions else None
+        if first_url:
+            recorded = urlparse(str(first_url))
+            current = urlparse(page.url)
+            if recorded.scheme in ("http", "https") and recorded.netloc == current.netloc and page.url != first_url:
+                add_log("Opening the first action's recorded page URL.",
+                        event_type="PAGE_NAVIGATION", status="RUNNING")
+                response = await page.goto(str(first_url), wait_until="domcontentloaded", timeout=60000)
+                add_log(f"Recorded page ready · HTTP {response.status if response else 'unknown'}.",
+                        event_type="PAGE_NAVIGATION", status="WORKED")
         for index, action in enumerate(actions):
             if stop_event.is_set(): break
             number = index + 1
@@ -428,56 +565,48 @@ async def run_replay(actions: list[dict]) -> None:
                       "selector": str(target.get("selector") or "")[:240],
                       "status": "DETECTING", "detected": False,
                       "dispatched": False, "response_observed": False,
-                      "signals": [], "elapsed_ms": 0, "url": page.url if page else ""}
+                      "signals": [], "elapsed_ms": 0,
+                      "gap_ms": max(0, int(action.get("gapMs") or 0)),
+                      "url": page.url if page else ""}
             state["action_results"].append(result)
             add_log(f"Action {number}/{len(actions)}: looking for {target_label!s:.100}.",
                     event_type="ACTION_DETECT", status="RUNNING")
-            # Respect the recorder's inter-click gap, with a hard upper bound.
-            delay = min(max(int(action.get("gapMs") or 0), 0), 3000)
-            if delay:
-                add_log(f"Action {number}: recorded delay {delay} ms.",
-                        event_type="ACTION_WAIT", status="INFO")
-                await asyncio.sleep(delay / 1000)
-                if stop_event.is_set(): break
-            deadline = time.monotonic() + ELEMENT_DETECT_TIMEOUT
-            locator = None
-            last_reason = "Target not present"
-            while time.monotonic() < deadline and not stop_event.is_set():
-                locator, reason = await resolve_target(action)
-                if locator is not None: break
-                last_reason = reason or last_reason
-                await asyncio.sleep(ELEMENT_RETRY_INTERVAL)
+            # The recording's gap is authoritative; detection itself has no fixed deadline.
+            if not await _wait_recorded_gap(action):
+                result["status"] = "STOPPED"
+                break
+            locator, last_reason = await wait_for_recorded_target(action)
             if stop_event.is_set():
                 result["status"] = "STOPPED"
+                result["error"] = last_reason
                 break
             if locator is None:
                 result["status"] = "FAILED_NOT_DETECTED"
-                result["error"] = last_reason
+                result["error"] = last_reason or "Browser page unavailable"
                 state["failed"] += 1
                 state["actions_done"] += 1
                 result["elapsed_ms"] = round((time.monotonic()-action_started)*1000)
-                add_log(f"Action {number}: NOT DETECTED; stopped in sequence. {last_reason}.",
+                add_log(f"Action {number}: target unavailable. {result['error']}.",
                         "WARN", event_type="ACTION_DETECT", status="FAILED")
-                # Fail closed: do not execute later actions out of order.
                 break
             result["detected"] = True
             result["status"] = "DETECTED"
             add_log(f"Action {number}: target uniquely detected and fingerprint matched.",
                     event_type="ACTION_DETECT", status="WORKED")
             try:
-                await locator.scroll_into_view_if_needed(timeout=2500)
+                await locator.scroll_into_view_if_needed(timeout=0)
                 # Re-resolve immediately before dispatch to avoid stale elements.
                 fresh, reason = await resolve_target(action)
                 if fresh is None:
                     raise RuntimeError("Target changed before click: " + str(reason))
                 before = await page_snapshot()
-                await fresh.click(timeout=5000, no_wait_after=True)
+                await fresh.click(timeout=0, no_wait_after=True)
                 result["dispatched"] = True
                 result["status"] = "DISPATCHED"
                 state["success"] += 1  # means browser click input dispatched, not task completed
                 add_log(f"Action {number}: Playwright click dispatched to verified target.",
                         event_type="ACTION_CLICK_DISPATCHED", status="WORKED")
-                evidence = await observe_page_response(before, 300)
+                evidence = await observe_page_response(before, 0)
                 result["response_observed"] = evidence["observed"]
                 result["signals"] = evidence["signals"]
                 result["after_url"] = (evidence.get("after") or {}).get("url", page.url)
@@ -505,8 +634,6 @@ async def run_replay(actions: list[dict]) -> None:
             state["run_elapsed_ms"] = round((time.monotonic()-started)*1000)
             add_log(f"Action {number} finished: {result['status']} in {result['elapsed_ms']} ms.",
                     event_type="ACTION_FINISH", status="WORKED" if result["dispatched"] else "FAILED")
-            # Small pacing delay prevents a tight burst; recorded gaps remain authoritative.
-            await asyncio.sleep(0.35)
     except Exception as exc:
         add_log(f"Replay engine error: {type(exc).__name__}: {str(exc)[:220]}",
                 "ERROR", event_type="REPLAY_ERROR", status="FAILED")
