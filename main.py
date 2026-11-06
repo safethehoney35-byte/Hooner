@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from privacy_shield import PrivacyShield
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
 MAX_ACTIONS = 5000
 LOG_LIMIT = 240
@@ -29,7 +29,8 @@ state: dict[str, Any] = {
     "started_at": None, "actions_total": 0, "actions_done": 0,
     "success": 0, "failed": 0, "current_action": None,
     "diagnostics": {}, "activity": [], "errors": [], "events": [],
-    "session_id": None, "replay_running": False,
+    "session_id": None, "replay_running": False, "verified": 0,
+    "action_results": [], "run_started_at": None, "run_elapsed_ms": 0,
 }
 playwright = browser = context = page = None
 replay_task: asyncio.Task | None = None
@@ -113,6 +114,8 @@ async def browser_diagnostics() -> dict[str, Any]:
       const resources=performance.getEntriesByType('resource');
       const checks=[];
       const add=(name,status,detail)=>checks.push({name,status,detail:String(detail)});
+      add('Current page','ok',location.href);
+      add('Page title','info',document.title||'Untitled');
       add('JavaScript','ok','Enabled');
       add('Cookies',navigator.cookieEnabled?'ok':'warning',navigator.cookieEnabled?'Available':'Disabled');
       add('Browser', 'ok', navigator.userAgent);
@@ -243,62 +246,164 @@ async def execute_action(action: dict, number: int) -> tuple[bool, str]:
     return False, "Timed out waiting for recorded target: " + last_reason
 
 
-async def run_replay(actions: list[dict]) -> None:
-    pending = list(enumerate(actions))
-    done: set[int] = set()
-    state.update(status="REPLAYING", replay_running=True, actions_total=len(actions),
-                 actions_done=0, success=0, failed=0, current_action=None)
-    add_log(f"Replay started with {len(actions)} recorded actions.", event_type="REPLAY_START", status="RUNNING")
+async def observe_page_response(before: dict[str, Any], wait_ms: int = 900) -> dict[str, Any]:
+    """Collect observable browser evidence after a dispatched click.
+
+    This is evidence of a page response, not proof that the intended business
+    operation completed. A mutation alone can be unrelated page activity.
+    """
+    await asyncio.sleep(wait_ms / 1000)
+    if page is None or page.is_closed():
+        return {"observed": False, "signals": ["page_closed"]}
     try:
-        # Contextual scheduler: each pass checks all remaining actions against the
-        # live page, so a currently-present later-step target need not wait behind
-        # earlier actions that belong to a page state already passed.
-        while pending and not stop_event.is_set():
-            progressed = False
-            for original_index, action in list(pending):
+        after = await page.evaluate("""() => ({url:location.href,title:document.title,
+          textLength:(document.body?.innerText||'').length,
+          readyState:document.readyState,
+          mutationCount:window.__nexusMutationCount||0})""")
+    except Exception as exc:
+        return {"observed": False, "signals": ["snapshot_error:" + type(exc).__name__]}
+    signals = []
+    if after.get("url") != before.get("url"): signals.append("url_changed")
+    if after.get("title") != before.get("title"): signals.append("title_changed")
+    if after.get("textLength") != before.get("textLength"): signals.append("page_text_length_changed")
+    if after.get("mutationCount", 0) > 0: signals.append("dom_mutation_observed")
+    return {"observed": bool(signals), "signals": signals, "after": after}
+
+
+async def page_snapshot() -> dict[str, Any]:
+    return await page.evaluate("""() => {
+      window.__nexusMutationCount = 0;
+      if (!window.__nexusObserver) {
+        window.__nexusObserver = new MutationObserver(records => {
+          window.__nexusMutationCount = (window.__nexusMutationCount || 0) + records.length;
+        });
+        window.__nexusObserver.observe(document.documentElement, {
+          subtree:true, childList:true, attributes:true, characterData:true
+        });
+      }
+      return {url:location.href,title:document.title,
+        textLength:(document.body?.innerText||'').length,
+        readyState:document.readyState,mutationCount:0};
+    }""")
+
+
+async def run_replay(actions: list[dict]) -> None:
+    """Run strictly in recorded order. Never scan ahead for a later target."""
+    started = time.monotonic()
+    state.update(status="REPLAYING", replay_running=True, actions_total=len(actions),
+                 actions_done=0, success=0, verified=0, failed=0,
+                 current_action=None, action_results=[], run_started_at=time.time(),
+                 run_elapsed_ms=0)
+    add_log(f"Replay started: {len(actions)} actions; strict recorded order enabled.",
+            event_type="REPLAY_START", status="RUNNING")
+    try:
+        for index, action in enumerate(actions):
+            if stop_event.is_set(): break
+            number = index + 1
+            state["current_action"] = number
+            action_started = time.monotonic()
+            target = action.get("target") or {}
+            target_label = (target.get("text") or target.get("ariaLabel") or
+                            target.get("id") or target.get("selector") or target.get("tag") or "unknown target")
+            result = {"number": number, "target": str(target_label)[:120],
+                      "selector": str(target.get("selector") or "")[:240],
+                      "status": "DETECTING", "detected": False,
+                      "dispatched": False, "response_observed": False,
+                      "signals": [], "elapsed_ms": 0, "url": page.url if page else ""}
+            state["action_results"].append(result)
+            add_log(f"Action {number}/{len(actions)}: looking for {target_label!s:.100}.",
+                    event_type="ACTION_DETECT", status="RUNNING")
+            # Respect the recorder's inter-click gap, with a hard upper bound.
+            delay = min(max(int(action.get("gapMs") or 0), 0), 30000)
+            if delay:
+                add_log(f"Action {number}: recorded delay {delay} ms.",
+                        event_type="ACTION_WAIT", status="INFO")
+                await asyncio.sleep(delay / 1000)
                 if stop_event.is_set(): break
-                state["current_action"] = original_index + 1
-                locator, _ = await resolve_target(action)
-                if locator is None:
-                    continue
-                ok, detail = await execute_action(action, original_index + 1)
-                pending = [(i,a) for i,a in pending if i != original_index]
-                done.add(original_index)
-                state["actions_done"] = len(done)
-                if ok:
-                    state["success"] += 1
-                    add_log(f"Action {original_index+1}: {detail}.", event_type="REPLAY_ACTION", status="WORKED")
-                else:
-                    state["failed"] += 1
-                    add_log(f"Action {original_index+1}: {detail}.", "WARN",
-                            event_type="REPLAY_ACTION", status="FAILED")
-                progressed = True
-                await asyncio.sleep(0.25)
+            deadline = time.monotonic() + 12
+            locator = None
+            last_reason = "Target not present"
+            while time.monotonic() < deadline and not stop_event.is_set():
+                locator, reason = await resolve_target(action)
+                if locator is not None: break
+                last_reason = reason or last_reason
+                await asyncio.sleep(0.3)
+            if stop_event.is_set():
+                result["status"] = "STOPPED"
                 break
-            if not progressed:
-                # No current target: wait for client-side rendering / SPA updates.
-                await asyncio.sleep(0.35)
-                if stop_event.is_set(): break
-                # Bound a no-match wait, but keep retrying dynamic elements for 30s.
-                if not hasattr(run_replay, "_idle_since"): run_replay._idle_since = time.monotonic()
-                if time.monotonic() - run_replay._idle_since > 30:
-                    for idx, _ in pending:
-                        state["failed"] += 1
-                        add_log(f"Action {idx+1}: target did not appear within 30 seconds.",
-                                "WARN", event_type="REPLAY_ACTION", status="FAILED")
-                    pending.clear()
-                continue
-            if hasattr(run_replay, "_idle_since"): delattr(run_replay, "_idle_since")
+            if locator is None:
+                result["status"] = "FAILED_NOT_DETECTED"
+                result["error"] = last_reason
+                state["failed"] += 1
+                state["actions_done"] += 1
+                result["elapsed_ms"] = round((time.monotonic()-action_started)*1000)
+                add_log(f"Action {number}: NOT DETECTED; stopped in sequence. {last_reason}.",
+                        "WARN", event_type="ACTION_DETECT", status="FAILED")
+                # Fail closed: do not execute later actions out of order.
+                break
+            result["detected"] = True
+            result["status"] = "DETECTED"
+            add_log(f"Action {number}: target uniquely detected and fingerprint matched.",
+                    event_type="ACTION_DETECT", status="WORKED")
+            try:
+                await locator.scroll_into_view_if_needed(timeout=2500)
+                # Re-resolve immediately before dispatch to avoid stale elements.
+                fresh, reason = await resolve_target(action)
+                if fresh is None:
+                    raise RuntimeError("Target changed before click: " + str(reason))
+                before = await page_snapshot()
+                await fresh.click(timeout=5000, no_wait_after=True)
+                result["dispatched"] = True
+                result["status"] = "DISPATCHED"
+                state["success"] += 1  # means browser click input dispatched, not task completed
+                add_log(f"Action {number}: Playwright click dispatched to verified target.",
+                        event_type="ACTION_CLICK_DISPATCHED", status="WORKED")
+                evidence = await observe_page_response(before, 1000)
+                result["response_observed"] = evidence["observed"]
+                result["signals"] = evidence["signals"]
+                result["after_url"] = (evidence.get("after") or {}).get("url", page.url)
+                if evidence["observed"]:
+                    result["status"] = "RESPONSE_OBSERVED"
+                    state["verified"] += 1
+                    add_log(f"Action {number}: page response signal(s): {', '.join(evidence['signals'])}.",
+                            event_type="ACTION_RESPONSE", status="WORKED")
+                else:
+                    result["status"] = "DISPATCHED_NO_RESPONSE_EVIDENCE"
+                    add_log(f"Action {number}: click dispatched, but no generic page-response signal was observed. This is not a verified task success.",
+                            "WARN", event_type="ACTION_RESPONSE", status="UNCERTAIN")
+            except Exception as exc:
+                result["status"] = "FAILED_CLICK"
+                result["error"] = str(exc).splitlines()[0][:200]
+                state["failed"] += 1
+                add_log(f"Action {number}: click failed: {result['error']}.",
+                        "ERROR", event_type="ACTION_CLICK", status="FAILED")
+                state["actions_done"] += 1
+                result["elapsed_ms"] = round((time.monotonic()-action_started)*1000)
+                break
+            result["elapsed_ms"] = round((time.monotonic()-action_started)*1000)
+            result["url"] = page.url if page and not page.is_closed() else "page closed"
+            state["actions_done"] += 1
+            state["run_elapsed_ms"] = round((time.monotonic()-started)*1000)
+            add_log(f"Action {number} finished: {result['status']} in {result['elapsed_ms']} ms.",
+                    event_type="ACTION_FINISH", status="WORKED" if result["dispatched"] else "FAILED")
+            # Small pacing delay prevents a tight burst; recorded gaps remain authoritative.
+            await asyncio.sleep(0.35)
     except Exception as exc:
         add_log(f"Replay engine error: {type(exc).__name__}: {str(exc)[:220]}",
                 "ERROR", event_type="REPLAY_ERROR", status="FAILED")
         state["message"] = str(exc)[:300]
     finally:
+        state["run_elapsed_ms"] = round((time.monotonic()-started)*1000)
         state["replay_running"] = False
         state["current_action"] = None
         state["status"] = "READY" if page and not page.is_closed() else "STOPPED"
-        state["message"] = "Replay stopped." if stop_event.is_set() else "Replay finished."
-        add_log(state["message"] + f" Success {state['success']} · Failed {state['failed']}.",
+        if stop_event.is_set():
+            state["message"] = "Replay stopped by user."
+        elif state["failed"]:
+            state["message"] = "Replay halted at first failed action; later actions were not attempted."
+        else:
+            state["message"] = "Replay sequence finished. Check response evidence per action."
+        add_log(state["message"] + f" Dispatched {state['success']} · response signals {state['verified']} · failed {state['failed']} · elapsed {state['run_elapsed_ms']} ms.",
                 event_type="REPLAY_FINISH", status="WORKED" if not state["failed"] else "UNCERTAIN")
 
 
@@ -351,8 +456,8 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
         await cleanup_browser()
         stop_event.clear()
         state.update(status="STARTING",url=req.url,title="",message="Opening website...",
-                     actions_total=0,actions_done=0,success=0,failed=0,current_action=None,
-                     diagnostics={},started_at=time.time(),session_id=str(uuid.uuid4()))
+                     actions_total=0,actions_done=0,success=0,verified=0,failed=0,current_action=None,
+                     action_results=[],run_elapsed_ms=0,diagnostics={},started_at=time.time(),session_id=str(uuid.uuid4()))
         try:
             await launch_browser(req.url)
         except Exception as exc:
