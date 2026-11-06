@@ -21,6 +21,8 @@ from privacy_shield import PrivacyShield
 APP_VERSION = "2.1.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
 MAX_ACTIONS = 5000
+ELEMENT_DETECT_TIMEOUT = 3.0
+ELEMENT_RETRY_INTERVAL = 0.15
 LOG_LIMIT = 240
 HOST_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
 
@@ -167,7 +169,7 @@ async def launch_browser(url: str) -> None:
         "WARN", event_type="NETWORK_REQUEST", status="FAILED"))
     add_log("Opening requested website.", event_type="PAGE_NAVIGATION", status="RUNNING")
     response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    try: await page.wait_for_load_state("load", timeout=12000)
+    try: await page.wait_for_load_state("load", timeout=3000)
     except Exception: add_log("Page load event did not finish within 12 seconds; continuing with live page.",
                                "WARN", event_type="PAGE_LOADING", status="UNCERTAIN")
     state["title"] = await page.title()
@@ -176,6 +178,81 @@ async def launch_browser(url: str) -> None:
             event_type="PAGE_LOADING", status="WORKED")
     state.update(status="READY", message="Website ready. Load a JSON recording to replay.")
 
+
+
+def is_linkvertise_page() -> bool:
+    """Keep this build in inspection-only mode on Linkvertise/ad-gating pages."""
+    try:
+        host = (urlparse(page.url).hostname or "").lower() if page else ""
+        return host == "linkvertise.com" or host.endswith(".linkvertise.com")
+    except Exception:
+        return False
+
+
+async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
+    """Inspect candidates without clicking. Reports duplicates across page frames."""
+    reports = []
+    for number, action in enumerate(actions, 1):
+        target = action.get("target") or {}
+        selectors = []
+        if target.get("selector"): selectors.append(str(target["selector"]))
+        if target.get("id"): selectors.append("#" + str(target["id"]).replace('"', '\\"'))
+        if target.get("testId"): selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\\"') + '"]')
+        if target.get("ariaLabel"): selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\\"') + '"]')
+        if target.get("name"): selectors.append('[name="' + str(target["name"]).replace('"', '\\"') + '"]')
+        candidates, seen = [], set()
+        for frame_index, frame in enumerate(page.frames):
+            for selector in dict.fromkeys(selectors):
+                try:
+                    loc = frame.locator(selector)
+                    count = min(await loc.count(), 30)
+                    for idx in range(count):
+                        el = loc.nth(idx)
+                        info = await el.evaluate("""el => {
+                          const s=getComputedStyle(el), r=el.getBoundingClientRect();
+                          return {tag:el.tagName.toLowerCase(),id:el.id||'',testId:el.getAttribute('data-testid')||'',
+                            ariaLabel:el.getAttribute('aria-label')||'',name:el.getAttribute('name')||'',
+                            text:(el.innerText||el.textContent||el.value||'').replace(/\\s+/g,' ').trim().slice(0,120),
+                            visible:!!(el.getClientRects().length)&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0,
+                            disabled:!!el.disabled||el.getAttribute('aria-disabled')==='true'};
+                        }""")
+                        key = (frame_index, selector, idx, info.get("tag"), info.get("id"), info.get("text"))
+                        if key in seen: continue
+                        seen.add(key)
+                        if fingerprint_matches(info, target):
+                            candidates.append({"frame":frame_index,"selector":selector,**info,"fingerprint_match":True})
+                except Exception:
+                    continue
+        eligible = [c for c in candidates if c["visible"] and not c["disabled"]]
+        highlighted = False
+        if len(eligible) == 1:
+            c = eligible[0]
+            try:
+                frame = page.frames[c["frame"]]
+                loc = frame.locator(c["selector"])
+                # Highlight only if this selector is unique in its frame.
+                if await loc.count() == 1:
+                    await loc.evaluate("""el => {
+                      el.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
+                      el.style.setProperty('outline','3px solid #22c55e','important');
+                      el.style.setProperty('outline-offset','3px','important');
+                    }""")
+                    highlighted = True
+            except Exception:
+                pass
+        reports.append({
+            "number":number,
+            "label":str(target.get("text") or target.get("ariaLabel") or target.get("id") or target.get("selector") or target.get("tag") or "target")[:100],
+            "candidate_count":len(candidates),
+            "visible_enabled_count":len(eligible),
+            "unique_target":len(eligible)==1,
+            "highlighted":highlighted,
+            "candidates":candidates[:12],
+            "message":("Unique visible candidate highlighted" if highlighted else
+                       "No visible candidate" if not eligible else
+                       "Multiple visible candidates; no element highlighted")
+        })
+    return reports
 
 def fingerprint_matches(el: dict, target: dict) -> bool:
     for key, attr in (("tag","tag"),("id","id"),("testId","data-testid"),
@@ -227,9 +304,9 @@ async def execute_action(action: dict, number: int) -> tuple[bool, str]:
                 return False, "Recorded action origin does not match current page"
         except Exception:
             return False, "Invalid recorded action URL"
-    delay = min(max(int(action.get("gapMs") or 0), 0), 30000)
+    delay = min(max(int(action.get("gapMs") or 0), 0), 3000)
     if delay: await asyncio.sleep(delay)
-    deadline = time.monotonic() + 12
+    deadline = time.monotonic() + ELEMENT_DETECT_TIMEOUT
     last_reason = "Target not present"
     while time.monotonic() < deadline and not stop_event.is_set():
         locator, reason = await resolve_target(action)
@@ -242,7 +319,7 @@ async def execute_action(action: dict, number: int) -> tuple[bool, str]:
                 last_reason = str(exc).splitlines()[0][:180]
         else:
             last_reason = reason or last_reason
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(ELEMENT_RETRY_INTERVAL)
     return False, "Timed out waiting for recorded target: " + last_reason
 
 
@@ -314,20 +391,20 @@ async def run_replay(actions: list[dict]) -> None:
             add_log(f"Action {number}/{len(actions)}: looking for {target_label!s:.100}.",
                     event_type="ACTION_DETECT", status="RUNNING")
             # Respect the recorder's inter-click gap, with a hard upper bound.
-            delay = min(max(int(action.get("gapMs") or 0), 0), 30000)
+            delay = min(max(int(action.get("gapMs") or 0), 0), 3000)
             if delay:
                 add_log(f"Action {number}: recorded delay {delay} ms.",
                         event_type="ACTION_WAIT", status="INFO")
                 await asyncio.sleep(delay / 1000)
                 if stop_event.is_set(): break
-            deadline = time.monotonic() + 12
+            deadline = time.monotonic() + ELEMENT_DETECT_TIMEOUT
             locator = None
             last_reason = "Target not present"
             while time.monotonic() < deadline and not stop_event.is_set():
                 locator, reason = await resolve_target(action)
                 if locator is not None: break
                 last_reason = reason or last_reason
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(ELEMENT_RETRY_INTERVAL)
             if stop_event.is_set():
                 result["status"] = "STOPPED"
                 break
@@ -358,7 +435,7 @@ async def run_replay(actions: list[dict]) -> None:
                 state["success"] += 1  # means browser click input dispatched, not task completed
                 add_log(f"Action {number}: Playwright click dispatched to verified target.",
                         event_type="ACTION_CLICK_DISPATCHED", status="WORKED")
-                evidence = await observe_page_response(before, 1000)
+                evidence = await observe_page_response(before, 300)
                 result["response_observed"] = evidence["observed"]
                 result["signals"] = evidence["signals"]
                 result["after_url"] = (evidence.get("after") or {}).get("url", page.url)
@@ -468,12 +545,25 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
     return {"ok":True,"status":"READY","message":"Website loaded."}
 
 
+@app.post("/api/inspect")
+async def inspect(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
+    require_key(x_nexus_key)
+    if page is None or page.is_closed() or state["status"] != "READY":
+        raise HTTPException(409, "Open an authorized test website before inspecting elements.")
+    if is_linkvertise_page():
+        raise HTTPException(403, "Element inspection is disabled on Linkvertise/ad-gating pages in this diagnostic build.")
+    reports = await inspect_workflow_targets(req.actions)
+    return {"ok": True, "inspection": reports}
+
+
 @app.post("/api/replay")
 async def replay(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
     global replay_task
     require_key(x_nexus_key)
     if page is None or page.is_closed() or state["status"] not in ("READY",):
         raise HTTPException(409,"Open a website before starting replay.")
+    if is_linkvertise_page():
+        raise HTTPException(403, "Replay is disabled on Linkvertise/ad-gating pages in this diagnostic build.")
     if replay_task and not replay_task.done():
         raise HTTPException(409,"Replay is already running.")
     stop_event.clear()
