@@ -1,40 +1,59 @@
 import unittest
-from main import BLOCKED_TERMS, DETECTION_ONLY, RESTRICTED_DETECTION_ACTIONS, detection_approval_policy, playwright_error_detail
 
-class SafetyRulesTest(unittest.TestCase):
-    def test_linkvertise_selectors_are_visible_but_not_automated(self):
-        self.assertEqual(set(DETECTION_ONLY), set(RESTRICTED_DETECTION_ACTIONS))
-        for name in DETECTION_ONLY:
-            allowed, reason = detection_approval_policy([name], clickable=True)
-            self.assertFalse(allowed, name)
-            self.assertTrue(reason, name)
+from main import (
+    REPLAY_BLOCKED_TERMS,
+    normalized_action,
+    replay_block_reason,
+    adapt_recorder_target,
+)
 
-    def test_ordinary_eligible_predefined_target_can_be_reviewed(self):
-        allowed, reason = detection_approval_policy([], clickable=True)
-        self.assertTrue(allowed)
-        self.assertIn("Eligible", reason)
 
-    def test_ineligible_predefined_target_has_reason(self):
-        allowed, reason = detection_approval_policy([], clickable=False)
-        self.assertFalse(allowed)
-        self.assertIn("not a visible", reason)
-
-    def test_playwright_error_keeps_actionability_call_log(self):
-        error = Exception("Timeout 7000ms exceeded.\nCall log:\n - waiting for locator(\"button\")\n - <div class=overlay> intercepts pointer events")
-        detail = playwright_error_detail(error)
-        self.assertIn("intercepts pointer events", detail)
-        self.assertIn("waiting for locator", detail)
-
-    def test_financial_and_destructive_labels_are_blocked(self):
-        for label in ("Payment", "Pay now", "Purchase", "Checkout", "Delete account", "Withdraw", "Payout", "Transfer"):
-            self.assertIsNotNone(BLOCKED_TERMS.search(label), label)
-
-    def test_ad_and_reward_labels_are_blocked(self):
-        for label in ("Watch Ads", "Skip Ad", "Watch ads to continue", "Skip advertisement", "Claim reward"):
-            self.assertIsNotNone(BLOCKED_TERMS.search(label), label)
+class ReplaySafetyTest(unittest.TestCase):
+    def test_ad_reward_financial_and_destructive_terms_are_blocked(self):
+        for label in (
+            "Watch Ads", "Skip Ad", "Watch ads to continue", "Claim reward",
+            "Pay now", "Purchase", "Checkout", "Delete account",
+            "Withdraw", "Payout", "Transfer",
+        ):
+            self.assertIsNotNone(REPLAY_BLOCKED_TERMS.search(label), label)
 
     def test_ordinary_label_is_not_blocked(self):
-        self.assertIsNone(BLOCKED_TERMS.search("Open settings"))
+        self.assertIsNone(REPLAY_BLOCKED_TERMS.search("Open settings"))
+
+    def test_replay_policy_blocks_ad_and_reward_targets(self):
+        for label in ("Watch Ads", "Continue to reward", "Skip Ad"):
+            action = normalized_action({
+                "type": "click",
+                "target": {"tag": "button", "text": label},
+                "gapMs": 100,
+            })
+            self.assertIsNotNone(replay_block_reason(action), label)
+
+    def test_replay_policy_allows_ordinary_target(self):
+        action = normalized_action({
+            "type": "click",
+            "target": {"tag": "button", "text": "Open settings"},
+            "gapMs": 100,
+        })
+        self.assertIsNone(replay_block_reason(action))
+
+    def test_normalization_preserves_target_identity_and_clamps_gap(self):
+        action = normalized_action({
+            "type": "click",
+            "gapMs": 9999999,
+            "target": {
+                "identity": {"fingerprint": {"tag": "button", "attrs": {"id": "save"}}},
+                "cssPath": "button#save",
+            },
+        })
+        self.assertEqual(action["gapMs"], 600000)
+        self.assertEqual(action["target"]["tag"], "button")
+        self.assertIn("button#save", action["target"]["_nexus_selectors"])
+
+    def test_invalid_action_is_rejected(self):
+        with self.assertRaises(ValueError):
+            normalized_action({"type": "type", "target": {}})
+
 
 if __name__ == "__main__":
     unittest.main()

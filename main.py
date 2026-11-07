@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import logging
 import os
+import re
 import socket
 import time
 import uuid
@@ -230,6 +231,51 @@ def adapt_recorder_target(raw: dict[str, Any]) -> dict[str, Any]:
     target["_nexus_attrs"] = merged_attrs
     target["_nexus_identity"] = identity
     return target
+
+
+# Do not replay ad/reward-flow, financial, or destructive controls.
+# These remain inspectable so the operator can understand why a workflow stops.
+REPLAY_BLOCKED_TERMS = re.compile(
+    r"\b(payment|pay now|purchase|checkout|delete|remove account|"
+    r"transfer|withdraw|payout|ad|ads|advertisement|reward|rewards)\b", re.I
+)
+
+
+def normalized_action(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a recorder action while preserving timing and page metadata."""
+    if not isinstance(raw, dict):
+        raise ValueError("Each workflow action must be an object.")
+    action = dict(raw)
+    if action.get("type") != "click":
+        raise ValueError("Only recorded click actions are supported.")
+    if not isinstance(action.get("target"), dict):
+        raise ValueError("Click action is missing its target object.")
+    action["target"] = adapt_recorder_target(action["target"])
+    try:
+        gap_ms = int(action.get("gapMs") or 0)
+    except (TypeError, ValueError, OverflowError):
+        gap_ms = 0
+    action["gapMs"] = min(600_000, max(0, gap_ms))
+    return action
+
+
+def replay_block_reason(action: dict[str, Any]) -> str | None:
+    """Refuse known risky labels/selectors; inspection remains available."""
+    target = action.get("target") if isinstance(action.get("target"), dict) else {}
+    attrs = target.get("_nexus_attrs") if isinstance(target.get("_nexus_attrs"), dict) else target.get("attrs", {})
+    pieces = [
+        target.get("text"), target.get("ariaLabel"), target.get("id"),
+        target.get("name"), target.get("selector"), target.get("uniqueSelector"),
+        target.get("cssPath"), " ".join(target.get("selectorCandidates", []))
+        if isinstance(target.get("selectorCandidates"), list) else "",
+        attrs.get("data-testid"), attrs.get("data-test"), attrs.get("data-qa"),
+        attrs.get("aria-label"), attrs.get("href"),
+    ]
+    label = " ".join(str(x or "") for x in pieces)
+    match = REPLAY_BLOCKED_TERMS.search(label)
+    if match:
+        return f"Blocked sensitive/ad/reward-flow target label or selector ({match.group(0)})."
+    return None
 
 
 def _normal_text(value: Any) -> str:
@@ -571,6 +617,16 @@ async def run_replay(actions: list[dict]) -> None:
             state["action_results"].append(result)
             add_log(f"Action {number}/{len(actions)}: looking for {target_label!s:.100}.",
                     event_type="ACTION_DETECT", status="RUNNING")
+            blocked_reason = replay_block_reason(action)
+            if blocked_reason:
+                result["status"] = "BLOCKED_BY_POLICY"
+                result["error"] = blocked_reason
+                state["failed"] += 1
+                state["actions_done"] += 1
+                result["elapsed_ms"] = round((time.monotonic()-action_started)*1000)
+                add_log(f"Action {number}: {blocked_reason}",
+                        "WARN", event_type="ACTION_POLICY", status="BLOCKED")
+                break
             # The recording's gap is authoritative; detection itself has no fixed deadline.
             if not await _wait_recorded_gap(action):
                 result["status"] = "STOPPED"

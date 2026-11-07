@@ -1,12 +1,18 @@
-# NEXUS AI Browser Monitor 1.7.0
+# NEXUS Replay Engine 2.3.0
 
-A lightweight, single-session Playwright browser monitor with:
-- URL input and Start/Stop state machine
-- Cleaner visible-control labels and page-signal summaries
-- Explicit Yes/No approval before supported control interactions
-- Activity and error logs
-- Ad/reward selector signals for visibility only
-- API access key protection
+NEXUS is a single-session Playwright browser replay service with:
+- Recorder V3.x JSON import and workflow preview
+- PEI target normalization, selector fallback, fingerprint and ancestor-context matching
+- Read-only workflow inspection with candidate counts and ambiguity reporting
+- Strict sequential replay with recorded inter-action gaps
+- Separate detection, click-dispatch, and observable page-response evidence
+- Live activity/error logs and browser diagnostics
+- API-key protection and Privacy Shield request filtering
+
+Replay refuses to guess when a target is ambiguous. Known ad/reward-flow, payment,
+financial-transfer, and destructive targets are blocked from replay; they can still
+be inspected. A click dispatch or generic DOM mutation is not proof that a website
+operation completed.
 
 ## Approval and safety model
 
@@ -128,3 +134,16 @@ Approval results distinguish a completed Playwright click from an observed page 
 The approval path is serialized so concurrent YES requests cannot race the single browser session. Each action performs a scroll-into-view and `locator.click(trial=True)` preflight before the real click. Preflight failures report that no click was sent and include Playwright's actionable call-log lines and a current DOM hit-test summary (bounding box, pointer-events, and center hit target). A timeout after the actual click call begins is marked `UNCERTAIN`; the system does not blindly retry because the page may already have received the click.
 
 The eight bundled Linkvertise selectors are still displayed as individual, deduplicated matches. Their YES controls are disabled because they represent ad-view, ad-skip, ad-gated continuation/destination, or informational status targets. NO decisions are recorded. Normal page controls continue to use the individual approval flow subject to the same safety checks.
+
+
+## Replay Engine 2.3.0 notes
+
+- `/api/inspect` and `/api/replay` both normalize recorder actions through
+  `normalized_action`; the previous build referenced this missing function.
+- The normalizer preserves PEI target identity and clamps recorded gaps to 10 minutes.
+- Replay policy blocks labels/selectors containing ad, reward, payment, purchase,
+  account deletion, transfer, withdrawal, or payout terms.
+- Verification commands:
+  `python -m unittest test_safety tests.test_safety -v`
+  and `node --check` on the inline script in `static/index.html`.
+- A live Render deployment and real third-party website session were not run here.
