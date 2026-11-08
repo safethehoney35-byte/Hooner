@@ -597,16 +597,26 @@ $('clearWorkflow').onclick=()=>{
   updateReplayBar(lastData||{});
 };
 
+// Recorder V3 exports can contain non-click events (wait, type, scroll, etc.).
+// This engine currently replays click actions only, so send only supported entries.
+function getReplayableActions(){
+  return Array.isArray(workflow?.actions)
+    ? workflow.actions.filter(a=>a&&typeof a==='object'&&a.type==='click'&&a.target&&typeof a.target==='object')
+    : [];
+}
+
 // ─── INSPECT ─────────────────────────────────────────────────────
 $('inspectBtn').onclick=async()=>{
   if(!workflow)return;
+  const actions=getReplayableActions();
+  if(!actions.length){$('inspectReport').innerHTML='<div class="empty err-c">No supported click actions with targets were found in this workflow.</div>'; $('inspectCard').style.display=''; return;}
   $('inspectBtn').disabled=true;
   $('inspectCard').style.display='';
   $('inspectReport').innerHTML='<div class="empty">Inspecting selectors on live page…</div>';
   // Switch to Replay tab so inspect results are visible
   switchTab('replayView');
   try{
-    const d=await api('/api/inspect',{method:'POST',body:JSON.stringify(workflow)});
+    const d=await api('/api/inspect',{method:'POST',body:JSON.stringify({actions})});
     $('inspectReport').innerHTML=d.inspection.map(x=>{
       const cls=x.unique_target?'unique':x.visible_enabled_count===0?'missing':'ambig';
       const icon=x.unique_target?'✓':x.visible_enabled_count===0?'✗':'⚠';
@@ -623,13 +633,17 @@ $('inspectBtn').onclick=async()=>{
 // ─── START REPLAY ─────────────────────────────────────────────────
 $('startReplayBtn').onclick=async()=>{
   if(!workflow){$('browserError').textContent='Load a JSON workflow first.';return}
+  const actions=getReplayableActions();
+  const skipped=(workflow.actions?.length||0)-actions.length;
+  if(!actions.length){$('browserError').textContent='Replay not started: this file has no supported click actions with target objects.';return}
   $('startReplayBtn').disabled=true;
   $('browserError').textContent='';
   try{
-    await api('/api/replay',{method:'POST',body:JSON.stringify(workflow)});
+    const result=await api('/api/replay',{method:'POST',body:JSON.stringify({actions})});
     switchTab('replayView');
+    if(skipped>0)$('browserError').textContent=`Replay queued ${actions.length} click actions; skipped ${skipped} unsupported recorder events.`;
     await refresh();
-  }catch(e){$('browserError').textContent=e.message}
+  }catch(e){$('browserError').textContent='Replay request rejected: '+e.message}
   finally{updateReplayBar(lastData||{})}
 };
 
