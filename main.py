@@ -43,10 +43,14 @@ log = logging.getLogger("nexus")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
-def add_log(message: str, level: str = "INFO", *, event_type: str = "LOG", status: str = "INFO") -> None:
+def add_log(message: str, level: str = "INFO", *, event_type: str = "LOG",
+            status: str = "INFO", details: dict[str, Any] | None = None) -> None:
     item = {"id": uuid.uuid4().hex[:10].upper(), "time": time.strftime("%H:%M:%S"),
             "timestamp": time.time(), "level": level, "event_type": event_type,
             "status": status, "message": str(message)[:500]}
+    if details:
+        # Keep diagnostic payloads bounded and avoid retaining arbitrary page data.
+        item["details"] = {str(k)[:60]: str(v)[:1200] for k, v in list(details.items())[:12]}
     state["activity"].append(item); state["activity"] = state["activity"][-LOG_LIMIT:]
     state["events"].append(item); state["events"] = state["events"][-LOG_LIMIT:]
     if level == "ERROR" or status == "FAILED":
@@ -104,8 +108,11 @@ async def route_guard(route) -> None:
     if allowed:
         await route.continue_()
     else:
-        add_log(f"Privacy Shield blocked {urlparse(route.request.url).hostname or 'unknown'} ({reason}).",
-                "WARN", event_type="NETWORK_REQUEST", status="BLOCKED")
+        safe_url = _safe_diagnostic_url(route.request.url)
+        add_log(f"Privacy Shield blocked {safe_url} ({reason}).",
+                "WARN", event_type="NETWORK_REQUEST", status="BLOCKED",
+                details={"url": safe_url, "resource_type": route.request.resource_type,
+                         "decision": "BLOCKED", "reason": reason})
         await route.abort()
 
 
@@ -150,6 +157,50 @@ async def cleanup_browser() -> None:
     page = context = browser = playwright = None
 
 
+def _safe_diagnostic_url(value: str) -> str:
+    """Keep scheme/host/path for debugging, but never log query strings or fragments."""
+    try:
+        parsed = urlparse(str(value))
+        host = parsed.hostname or "unknown"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return parsed._replace(netloc=host, query="", fragment="").geturl()[:1000]
+    except Exception:
+        return str(value).split("?", 1)[0].split("#", 1)[0][:1000]
+
+
+async def _record_response(response) -> None:
+    """Record script response status and MIME so HTML fallbacks are diagnosable."""
+    try:
+        request = response.request
+        resource_type = request.resource_type
+        status_code = response.status
+        headers = response.headers or {}
+        content_type = headers.get("content-type", "missing").split(";", 1)[0].strip().lower()
+        url = _safe_diagnostic_url(response.url)
+        is_script = resource_type == "script"
+        if not is_script and status_code < 400:
+            return
+        details = {"url": url, "resource_type": resource_type,
+                   "http_status": status_code, "content_type": content_type}
+        if is_script:
+            accepted = {"application/javascript", "text/javascript",
+                        "application/ecmascript", "text/ecmascript",
+                        "application/x-javascript"}
+            if content_type not in accepted:
+                add_log(f"Script response has unexpected MIME type: {url} · HTTP {status_code} · {content_type}.",
+                        "ERROR", event_type="SCRIPT_MIME_MISMATCH", status="FAILED",
+                        details=details)
+                return
+        add_log(f"HTTP {status_code} response: {url} · {resource_type} · {content_type}.",
+                "ERROR" if status_code >= 400 else "INFO",
+                event_type="RESOURCE_RESPONSE", status="FAILED" if status_code >= 400 else "INFO",
+                details=details)
+    except Exception as exc:
+        add_log(f"Could not record response diagnostics: {type(exc).__name__}.",
+                "WARN", event_type="DIAGNOSTIC_HANDLER", status="UNCERTAIN")
+
+
 async def launch_browser(url: str) -> None:
     global playwright, browser, context, page
     await validate_public_url(url)
@@ -160,18 +211,41 @@ async def launch_browser(url: str) -> None:
     context = await browser.new_context(viewport={"width":1280,"height":800}, java_script_enabled=True)
     await context.route("**/*", route_guard)
     page = await context.new_page()
-    page.on("pageerror", lambda exc: add_log(f"Page JavaScript error: {str(exc)[:220]}",
-        "ERROR", event_type="PAGE_JS_ERROR", status="FAILED"))
-    page.on("console", lambda msg: add_log(f"Console error: {msg.text[:220]}",
-        "ERROR", event_type="CONSOLE_ERROR", status="FAILED") if msg.type == "error" else None)
-    page.on("requestfailed", lambda req: add_log(
-        f"Request failed: {urlparse(req.url).hostname or 'unknown'} · {req.failure or 'unknown'}",
-        "WARN", event_type="NETWORK_REQUEST", status="FAILED"))
+
+    def on_page_error(exc) -> None:
+        stack = getattr(exc, "stack", "") or str(exc)
+        add_log(f"Page JavaScript error: {str(exc).splitlines()[0][:220]}",
+                "ERROR", event_type="PAGE_JS_ERROR", status="FAILED",
+                details={"message": str(exc), "stack": stack[:4000], "page_url": _safe_diagnostic_url(page.url)})
+
+    def on_console(msg) -> None:
+        if msg.type != "error":
+            return
+        location = getattr(msg, "location", {}) or {}
+        add_log(f"Console error: {msg.text[:220]}",
+                "ERROR", event_type="CONSOLE_ERROR", status="FAILED",
+                details={"message": msg.text, "url": _safe_diagnostic_url(location.get("url", "")),
+                         "line": location.get("lineNumber", ""), "column": location.get("columnNumber", ""),
+                         "page_url": _safe_diagnostic_url(page.url)})
+
+    def on_request_failed(req) -> None:
+        failure = getattr(req, "failure", None)
+        add_log(f"Request failed: {_safe_diagnostic_url(req.url)} · {failure or 'unknown'}",
+                "WARN", event_type="NETWORK_REQUEST", status="FAILED",
+                details={"url": _safe_diagnostic_url(req.url), "resource_type": req.resource_type,
+                         "method": req.method, "failure": failure or "unknown",
+                         "page_url": _safe_diagnostic_url(page.url)})
+
+    page.on("pageerror", on_page_error)
+    page.on("console", on_console)
+    page.on("requestfailed", on_request_failed)
+    page.on("response", lambda response: asyncio.create_task(_record_response(response)))
     add_log("Opening requested website.", event_type="PAGE_NAVIGATION", status="RUNNING")
     response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     try: await page.wait_for_load_state("load", timeout=3000)
-    except Exception: add_log("Page load event did not finish within 12 seconds; continuing with live page.",
-                               "WARN", event_type="PAGE_LOADING", status="UNCERTAIN")
+    except Exception: add_log("Page load event did not finish within 3 seconds; continuing with live page.",
+                               "WARN", event_type="PAGE_LOADING", status="UNCERTAIN",
+                               details={"wait_timeout_ms": 3000, "navigation_wait_until": "domcontentloaded"})
     state["title"] = await page.title()
     state["diagnostics"] = await browser_diagnostics()
     add_log(f"Website loaded: {state['title'] or page.url} · HTTP {response.status if response else 'unknown'}",
