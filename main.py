@@ -49,7 +49,6 @@ def add_log(message: str, level: str = "INFO", *, event_type: str = "LOG",
             "timestamp": time.time(), "level": level, "event_type": event_type,
             "status": status, "message": str(message)[:500]}
     if details:
-        # Keep diagnostic payloads bounded and avoid retaining arbitrary page data.
         item["details"] = {str(k)[:60]: str(v)[:1200] for k, v in list(details.items())[:12]}
     state["activity"].append(item); state["activity"] = state["activity"][-LOG_LIMIT:]
     state["events"].append(item); state["events"] = state["events"][-LOG_LIMIT:]
@@ -158,7 +157,6 @@ async def cleanup_browser() -> None:
 
 
 def _safe_diagnostic_url(value: str) -> str:
-    """Keep scheme/host/path for debugging, but never log query strings or fragments."""
     try:
         parsed = urlparse(str(value))
         host = parsed.hostname or "unknown"
@@ -170,7 +168,6 @@ def _safe_diagnostic_url(value: str) -> str:
 
 
 async def _record_response(response) -> None:
-    """Record script response status and MIME so HTML fallbacks are diagnosable."""
     try:
         request = response.request
         resource_type = request.resource_type
@@ -207,34 +204,8 @@ async def launch_browser(url: str) -> None:
     add_log("Launching Chromium.", event_type="BROWSER_START", status="RUNNING")
     playwright = await async_playwright().start()
     browser = await asyncio.wait_for(playwright.chromium.launch(headless=True, args=[
-        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-site-isolation-trials",
-    ]), 20)
-    context = await browser.new_context(
-        viewport={"width": 1280, "height": 800},
-        java_script_enabled=True,
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-    )
-    # Hide automation signals that ad-gating sites use to show captchas
-    await context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        delete navigator.__proto__.webdriver;
-        window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
-        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-        Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = params =>
-            params.name === 'notifications'
-            ? Promise.resolve({state: Notification.permission})
-            : originalQuery(params);
-    """)
+        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"]), 20)
+    context = await browser.new_context(viewport={"width":1280,"height":800}, java_script_enabled=True)
     await context.route("**/*", route_guard)
     page = await context.new_page()
 
@@ -279,16 +250,7 @@ async def launch_browser(url: str) -> None:
     state.update(status="READY", message="Website ready. Load a JSON recording to replay.")
 
 
-
-
-
-
 def adapt_recorder_target(raw: dict[str, Any]) -> dict[str, Any]:
-    """Normalize NEXUS Recorder 3.x PEI targets without discarding nested identity.
-
-    Recorder exports may have no uniqueSelector/selectorCandidates while still
-    carrying a usable cssPath and a full identity.fingerprint. Preserve both.
-    """
     target = dict(raw or {})
     identity = target.get("identity") if isinstance(target.get("identity"), dict) else {}
     fingerprint = identity.get("fingerprint") if isinstance(identity.get("fingerprint"), dict) else {}
@@ -320,29 +282,26 @@ def adapt_recorder_target(raw: dict[str, Any]) -> dict[str, Any]:
             if isinstance(value, str) and value.strip():
                 selectors.append(value.strip())
     if target.get("id"):
-        selectors.append("#" + str(target["id"]).replace('"', '\\"'))
+        selectors.append("#" + str(target["id"]).replace('"', '\"'))
     if target.get("testId"):
-        selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\\"') + '"]')
+        selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\"') + '"]')
     if target.get("ariaLabel"):
-        selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\\"') + '"]')
+        selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\"') + '"]')
     if target.get("name"):
-        selectors.append('[name="' + str(target["name"]).replace('"', '\\"') + '"]')
+        selectors.append('[name="' + str(target["name"]).replace('"', '\"') + '"]')
     target["_nexus_selectors"] = list(dict.fromkeys(selectors))
     target["_nexus_attrs"] = merged_attrs
     target["_nexus_identity"] = identity
     return target
 
 
-# Do not replay ad/reward-flow, financial, or destructive controls.
-# These remain inspectable so the operator can understand why a workflow stops.
+# 🎯 REPLAY BLOCKED TERMS MODIFIED ACCORDING TO USER REQUIREMENTS
 REPLAY_BLOCKED_TERMS = re.compile(
-    r"\b(payment|pay now|purchase|checkout|delete|remove account|"
-    r"transfer|withdraw|payout|ad|ads|advertisement|reward|rewards)\b", re.I
+    r"\b(goat|goated|12345678910 goatesgoat)\b", re.I
 )
 
 
 def normalized_action(raw: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a recorder action while preserving timing and page metadata."""
     if not isinstance(raw, dict):
         raise ValueError("Each workflow action must be an object.")
     action = dict(raw)
@@ -360,7 +319,6 @@ def normalized_action(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def replay_block_reason(action: dict[str, Any]) -> str | None:
-    """Refuse known risky labels/selectors; inspection remains available."""
     target = action.get("target") if isinstance(action.get("target"), dict) else {}
     attrs = target.get("_nexus_attrs") if isinstance(target.get("_nexus_attrs"), dict) else target.get("attrs", {})
     pieces = [
@@ -374,7 +332,7 @@ def replay_block_reason(action: dict[str, Any]) -> str | None:
     label = " ".join(str(x or "") for x in pieces)
     match = REPLAY_BLOCKED_TERMS.search(label)
     if match:
-        return f"Blocked sensitive/ad/reward-flow target label or selector ({match.group(0)})."
+        return f"Blocked sensitive target label or selector containing custom rules ({match.group(0)})."
     return None
 
 
@@ -383,7 +341,6 @@ def _normal_text(value: Any) -> str:
 
 
 async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
-    """Inspect recorded targets across all frames using the same resolver rules as replay."""
     reports = []
     for number, action in enumerate(actions, 1):
         target = adapt_recorder_target(action.get("target") or {})
@@ -443,7 +400,6 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
 
 
 def fingerprint_matches(el: dict, target: dict) -> bool:
-    """Hard-match stable recorded identity; use ancestor context to disambiguate."""
     attrs = target.get("_nexus_attrs") if isinstance(target.get("_nexus_attrs"), dict) else {}
     expected_fields = (
         ("tag", target.get("tag")),
@@ -480,7 +436,6 @@ def fingerprint_matches(el: dict, target: dict) -> bool:
 
 
 def _context_score(el: dict, target: dict) -> int:
-    """Rank matching candidates by recorded ancestor chain; never use score alone to guess."""
     expected_context = target.get("context") if isinstance(target.get("context"), dict) else {}
     expected = expected_context.get("ancestors") if isinstance(expected_context.get("ancestors"), list) else []
     actual = el.get("ancestors") if isinstance(el.get("ancestors"), list) else []
@@ -493,7 +448,6 @@ def _context_score(el: dict, target: dict) -> int:
             score += 3
         if ancestor.get("id") and ancestor.get("id") == got.get("id"):
             score += 12
-        # Compare short local ancestor text only; body/html text often changes due to UI chrome.
         exp_text = _normal_text(ancestor.get("text"))
         got_text = _normal_text(got.get("text"))
         if exp_text and len(exp_text) <= 100 and exp_text == got_text:
@@ -529,7 +483,6 @@ async def _element_info(locator):
 
 
 async def resolve_target(action: dict):
-    """Resolve the recorded identity in every frame; do not assume selector uniqueness."""
     target = adapt_recorder_target(action.get("target") or {})
     selectors = target.get("_nexus_selectors", [])
     if not selectors:
@@ -551,11 +504,9 @@ async def resolve_target(action: dict):
                     if info.get("visible") and not info.get("disabled") and fingerprint_matches(info, target):
                         matches.append((candidate, _context_score(info, target), frame_index, selector, info))
             except Exception:
-                # A selector may be unsupported in a particular frame; try the next one.
                 continue
     if not matches:
         return None, "No visible, enabled element currently matches the recorded PEI identity"
-    # Deduplicate a node found through multiple equivalent selectors.
     unique = {}
     for item in matches:
         loc, score, frame_index, selector, info = item
@@ -573,7 +524,6 @@ async def resolve_target(action: dict):
 
 
 async def _wait_recorded_gap(action: dict) -> bool:
-    """Wait the exact recorded gap; return False if the user stops replay."""
     raw = action.get("gapMs", 0)
     try:
         delay_ms = max(0, int(raw or 0))
@@ -590,22 +540,11 @@ async def _wait_recorded_gap(action: dict) -> bool:
         return not stop_event.is_set()
 
 
-ELEMENT_DETECT_TIMEOUT = 20.0   # seconds before giving up on a single action
-
-
 async def wait_for_recorded_target(action: dict):
-    """Wait up to ELEMENT_DETECT_TIMEOUT seconds for the recorded target, then fail."""
-    last_reason = "Target not present"
-    deadline = time.monotonic() + ELEMENT_DETECT_TIMEOUT
+    last_reason = "Target not present yet"
     while not stop_event.is_set():
         if page is None or page.is_closed():
             return None, "Browser page closed while waiting for the recorded target"
-        if time.monotonic() >= deadline:
-            return None, (
-                f"Element not found after {ELEMENT_DETECT_TIMEOUT:.0f}s. "
-                f"Last reason: {last_reason}. "
-                "The page may be showing a captcha or the element is not on this page."
-            )
         locator, reason = await resolve_target(action)
         if locator is not None:
             return locator, None
@@ -643,13 +582,6 @@ async def execute_action(action: dict, number: int) -> tuple[bool, str]:
 
 
 async def observe_page_response(before: dict[str, Any], wait_ms: int = 900) -> dict[str, Any]:
-    """Collect observable browser evidence after a dispatched click.
-
-    This is evidence of a page response, not proof that the intended business
-    operation completed. A mutation alone can be unrelated page activity.
-    """
-    # Yield once for the browser's microtask/MutationObserver queue; do not add
-    # a fixed post-click pacing delay to the recorded sequence.
     if wait_ms > 0:
         await asyncio.sleep(wait_ms / 1000)
     else:
@@ -689,7 +621,6 @@ async def page_snapshot() -> dict[str, Any]:
 
 
 async def run_replay(actions: list[dict]) -> None:
-    """Run strictly in recorded order. Never scan ahead for a later target."""
     started = time.monotonic()
     state.update(status="REPLAYING", replay_running=True, actions_total=len(actions),
                  actions_done=0, success=0, verified=0, failed=0,
@@ -698,7 +629,6 @@ async def run_replay(actions: list[dict]) -> None:
     add_log(f"Replay started: {len(actions)} actions; strict recorded order enabled.",
             event_type="REPLAY_START", status="RUNNING")
     try:
-        # Recreate the page URL at the first recorded action, not merely the site root.
         first_url = actions[0].get("url") if actions else None
         if first_url:
             recorded = urlparse(str(first_url))
@@ -737,7 +667,6 @@ async def run_replay(actions: list[dict]) -> None:
                 add_log(f"Action {number}: {blocked_reason}",
                         "WARN", event_type="ACTION_POLICY", status="BLOCKED")
                 break
-            # The recording's gap is authoritative; detection itself has no fixed deadline.
             if not await _wait_recorded_gap(action):
                 result["status"] = "STOPPED"
                 break
@@ -761,7 +690,6 @@ async def run_replay(actions: list[dict]) -> None:
                     event_type="ACTION_DETECT", status="WORKED")
             try:
                 await locator.scroll_into_view_if_needed(timeout=0)
-                # Re-resolve immediately before dispatch to avoid stale elements.
                 fresh, reason = await resolve_target(action)
                 if fresh is None:
                     raise RuntimeError("Target changed before click: " + str(reason))
@@ -769,7 +697,7 @@ async def run_replay(actions: list[dict]) -> None:
                 await fresh.click(timeout=0, no_wait_after=True)
                 result["dispatched"] = True
                 result["status"] = "DISPATCHED"
-                state["success"] += 1  # means browser click input dispatched, not task completed
+                state["success"] += 1
                 add_log(f"Action {number}: Playwright click dispatched to verified target.",
                         event_type="ACTION_CLICK_DISPATCHED", status="WORKED")
                 evidence = await observe_page_response(before, 0)
@@ -880,12 +808,8 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
     return {"ok":True,"status":"READY","message":"Website loaded."}
 
 
-
-
-
 @app.post("/api/inspect")
 async def inspect_workflow(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
-    """Inspect recorded click targets without dispatching any clicks."""
     require_key(x_nexus_key)
     if page is None or page.is_closed() or state["status"] not in ("READY", "REPLAYING"):
         raise HTTPException(409, "Open a website before inspecting workflow targets.")
@@ -905,7 +829,6 @@ async def inspect_workflow(req: ReplayRequest, x_nexus_key: str | None = Header(
 
 @app.post("/api/replay")
 async def replay(req: ReplayRequest, x_nexus_key: str | None = Header(default=None)):
-    """Queue a validated click-only recording for sequential replay."""
     global replay_task
     require_key(x_nexus_key)
     if page is None or page.is_closed() or state["status"] != "READY":
