@@ -274,24 +274,31 @@ def adapt_recorder_target(raw: dict[str, Any]) -> dict[str, Any]:
     target["name"] = target.get("name") or merged_attrs.get("name")
     target["text"] = target.get("text") or ""
 
-    selectors: list[str] = []
+    # Prefer stable semantic identities before recorder-generated CSS paths.
+    # Long nth-of-type paths are fragile when the site's DOM changes.
+    stable_selectors: list[str] = []
+    fallback_selectors: list[str] = []
+    if target.get("id"):
+        stable_selectors.append("#" + str(target["id"]).replace('"', '\\"'))
+    if target.get("testId"):
+        stable_selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\\"') + '"]')
+    if target.get("ariaLabel"):
+        stable_selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\\"') + '"]')
+    if target.get("name"):
+        stable_selectors.append('[name="' + str(target["name"]).replace('"', '\\"') + '"]')
+
     for source in (target, event_target):
         candidates = source.get("selectorCandidates")
         if isinstance(candidates, list):
-            selectors.extend(str(x).strip() for x in candidates if isinstance(x, str) and x.strip())
+            fallback_selectors.extend(
+                str(x).strip() for x in candidates
+                if isinstance(x, str) and x.strip()
+            )
         for key in ("uniqueSelector", "selector", "cssPath"):
             value = source.get(key)
             if isinstance(value, str) and value.strip():
-                selectors.append(value.strip())
-    if target.get("id"):
-        selectors.append("#" + str(target["id"]).replace('"', '\"'))
-    if target.get("testId"):
-        selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\"') + '"]')
-    if target.get("ariaLabel"):
-        selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\"') + '"]')
-    if target.get("name"):
-        selectors.append('[name="' + str(target["name"]).replace('"', '\"') + '"]')
-    target["_nexus_selectors"] = list(dict.fromkeys(selectors))
+                fallback_selectors.append(value.strip())
+    target["_nexus_selectors"] = list(dict.fromkeys(stable_selectors + fallback_selectors))
     target["_nexus_attrs"] = merged_attrs
     target["_nexus_identity"] = identity
     return target
@@ -411,9 +418,32 @@ def fingerprint_matches(el: dict, target: dict) -> bool:
         ("name", target.get("name") or attrs.get("name")),
         ("role", target.get("role") or attrs.get("role")),
     )
+    tag_mismatch = False
     for key, expected in expected_fields:
-        if expected and _normal_text(el.get(key)) != _normal_text(expected):
-            return False
+        if not expected:
+            continue
+        actual = _normal_text(el.get(key))
+        if actual == _normal_text(expected):
+            continue
+        if key == "tag":
+            tag_mismatch = True
+            continue
+        return False
+
+    # A site's framework can replace a wrapper tag while preserving its
+    # explicit test id / id / aria-label / name. Trust that strong identity,
+    # but only after it has matched exactly; resolver still enforces uniqueness.
+    strong_identity_matches = any(
+        expected and _normal_text(el.get(key)) == _normal_text(expected)
+        for key, expected in (
+            ("id", target.get("id") or attrs.get("id")),
+            ("testId", target.get("testId") or attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa")),
+            ("ariaLabel", target.get("ariaLabel") or attrs.get("aria-label")),
+            ("name", target.get("name") or attrs.get("name")),
+        )
+    )
+    if tag_mismatch and not strong_identity_matches:
+        return False
 
     expected_text = _normal_text(target.get("text"))
     actual_text = _normal_text(el.get("text"))
@@ -504,10 +534,16 @@ async def resolve_target(action: dict):
     selectors = target.get("_nexus_selectors", [])
     if not selectors:
         return None, "Recording contains no usable selector or CSS path"
+
     matches = []
     seen = set()
-    for frame_index, frame in enumerate(list(page.frames)):
-        for selector in selectors:
+    frames = list(page.frames)
+
+    # Stable selectors are ordered first by adapt_recorder_target. Resolve
+    # them independently before trying brittle recorder-generated CSS paths.
+    for selector_index, selector in enumerate(selectors):
+        selector_matches = []
+        for frame_index, frame in enumerate(frames):
             try:
                 loc = frame.locator(selector)
                 count = min(await loc.count(), 100)
@@ -519,9 +555,23 @@ async def resolve_target(action: dict):
                         continue
                     seen.add(key)
                     if info.get("visible") and not info.get("disabled") and fingerprint_matches(info, target):
-                        matches.append((candidate, _context_score(info, target), frame_index, selector, info))
+                        item = (candidate, _context_score(info, target), frame_index, selector, info)
+                        matches.append(item)
+                        selector_matches.append(item)
             except Exception:
                 continue
+
+        # A unique exact match from an explicit id/test-id/aria/name selector
+        # is stronger than a stale CSS path. Avoid scanning every fallback.
+        is_stable_selector = selector.startswith(("#", "[data-testid=", "[aria-label=", "[name="))
+        if is_stable_selector and selector_matches:
+            unique_stable = {}
+            for item in selector_matches:
+                info = item[4]
+                unique_stable[(item[2], info.get("domPath"))] = item
+            if len(unique_stable) == 1:
+                return next(iter(unique_stable.values()))[0], None
+
     if not matches:
         return None, "No visible, enabled element currently matches the recorded PEI identity"
     unique = {}
