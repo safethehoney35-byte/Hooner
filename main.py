@@ -22,9 +22,9 @@ from privacy_shield import PrivacyShield
 APP_VERSION = "2.3.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
 MAX_ACTIONS = 5000
-ELEMENT_RETRY_INTERVAL = 0.25  # responsive, low-CPU target polling
-ELEMENT_WAIT_TIMEOUT_SECONDS = max(3, min(120, int(os.getenv("NEXUS_ELEMENT_WAIT_SECONDS", "20"))))
-MAX_SELECTOR_CANDIDATES = 250
+ELEMENT_RETRY_INTERVAL = 0.25  # event-friendly polling
+ELEMENT_DETECTION_TIMEOUT = 20.0  # bounded wait after the recorded gap
+GAP_SCAN_INTERVAL = 0.50  # look for delayed controls while the recorded gap elapses
 LOG_LIMIT = 240
 HOST_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
 
@@ -33,7 +33,6 @@ state: dict[str, Any] = {
     "started_at": None, "actions_total": 0, "actions_done": 0,
     "success": 0, "failed": 0, "current_action": None,
     "diagnostics": {}, "activity": [], "errors": [], "events": [],
-    "detection_metrics": {"attempts": 0, "elapsed_ms": 0, "last_scan_ms": 0},
     "session_id": None, "replay_running": False, "verified": 0,
     "action_results": [], "run_started_at": None, "run_elapsed_ms": 0,
 }
@@ -242,8 +241,10 @@ async def launch_browser(url: str) -> None:
     page.on("response", lambda response: asyncio.create_task(_record_response(response)))
     add_log("Opening requested website.", event_type="PAGE_NAVIGATION", status="RUNNING")
     response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    # Avoid waiting for images, fonts and third-party resources after DOM is ready.
-    # Late targets are resolved on demand by wait_for_recorded_target().
+    try: await page.wait_for_load_state("load", timeout=3000)
+    except Exception: add_log("Page load event did not finish within 3 seconds; continuing with live page.",
+                               "WARN", event_type="PAGE_LOADING", status="UNCERTAIN",
+                               details={"wait_timeout_ms": 3000, "navigation_wait_until": "domcontentloaded"})
     state["title"] = await page.title()
     state["diagnostics"] = await browser_diagnostics()
     add_log(f"Website loaded: {state['title'] or page.url} · HTTP {response.status if response else 'unknown'}",
@@ -344,7 +345,6 @@ def _normal_text(value: Any) -> str:
 async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
     reports = []
     for number, action in enumerate(actions, 1):
-        scan_started = time.monotonic()
         target = adapt_recorder_target(action.get("target") or {})
         selectors = target.get("_nexus_selectors", [])
         candidates, seen = [], set()
@@ -352,7 +352,7 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
             for selector in selectors:
                 try:
                     loc = frame.locator(selector)
-                    count = min(await loc.count(), MAX_SELECTOR_CANDIDATES)
+                    count = min(await loc.count(), 100)
                     for idx in range(count):
                         el = loc.nth(idx)
                         info = await _element_info(el)
@@ -388,7 +388,6 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
                 pass
         reports.append({
             "number": number,
-            "scan_elapsed_ms": round((time.monotonic() - scan_started) * 1000),
             "label": str(target.get("text") or target.get("ariaLabel") or target.get("id") or target.get("tag") or "target")[:100],
             "candidate_count": len(candidates),
             "visible_enabled_count": len(eligible),
@@ -419,7 +418,22 @@ def fingerprint_matches(el: dict, target: dict) -> bool:
     expected_text = _normal_text(target.get("text"))
     actual_text = _normal_text(el.get("text"))
     if expected_text and expected_text not in actual_text:
-        return False
+        # Some pages reuse a stable control (id/test-id/aria-label) while its
+        # visible copy changes between stages, e.g. a generic "skip_next"
+        # control becoming "Skip Ad". Permit that text change only when a
+        # strong recorded identity attribute is present and has already
+        # matched above. Candidate uniqueness is still enforced by resolver.
+        strong_identity = any(
+            expected and _normal_text(el.get(key)) == _normal_text(expected)
+            for key, expected in (
+                ("id", target.get("id") or attrs.get("id")),
+                ("testId", target.get("testId") or attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa")),
+                ("ariaLabel", target.get("ariaLabel") or attrs.get("aria-label")),
+                ("name", target.get("name") or attrs.get("name")),
+            )
+        )
+        if not strong_identity:
+            return False
 
     live_attrs = el.get("attrs") if isinstance(el.get("attrs"), dict) else {}
     for attr_name in ("type", "role", "placeholder", "title", "alt", "href"):
@@ -496,7 +510,7 @@ async def resolve_target(action: dict):
         for selector in selectors:
             try:
                 loc = frame.locator(selector)
-                count = min(await loc.count(), MAX_SELECTOR_CANDIDATES)
+                count = min(await loc.count(), 100)
                 for index in range(count):
                     candidate = loc.nth(index)
                     info = await _element_info(candidate)
@@ -543,34 +557,82 @@ async def _wait_recorded_gap(action: dict) -> bool:
         return not stop_event.is_set()
 
 
-async def wait_for_recorded_target(action: dict):
+def _action_origin_matches(action: dict) -> bool:
+    """Avoid wasting a full detection timeout after the site redirects away."""
+    action_url = action.get("url")
+    if not action_url or page is None or page.is_closed():
+        return True
+    try:
+        expected = urlparse(str(action_url))
+        current = urlparse(page.url)
+        return (expected.scheme in ("http", "https") and
+                expected.netloc.casefold() == current.netloc.casefold())
+    except Exception:
+        return False
+
+
+async def wait_for_recorded_target(action: dict, timeout: float = ELEMENT_DETECTION_TIMEOUT):
     last_reason = "Target not present yet"
+    deadline = time.monotonic() + max(0.1, timeout)
     attempts = 0
-    started = time.monotonic()
     while not stop_event.is_set():
         if page is None or page.is_closed():
             return None, "Browser page closed while waiting for the recorded target"
-        scan_started = time.monotonic()
-        locator, reason = await resolve_target(action)
-        scan_ms = round((time.monotonic() - scan_started) * 1000)
+        if not _action_origin_matches(action):
+            return None, "Page navigated to a different origin before the recorded target appeared"
         attempts += 1
-        last_reason = reason or last_reason
-        state["detection_metrics"] = {
-            "attempts": attempts,
-            "elapsed_ms": round((time.monotonic() - started) * 1000),
-            "last_scan_ms": scan_ms,
-        }
+        locator, reason = await resolve_target(action)
         if locator is not None:
             return locator, None
-        if time.monotonic() - started >= ELEMENT_WAIT_TIMEOUT_SECONDS:
-            return None, (f"Target was not found after {ELEMENT_WAIT_TIMEOUT_SECONDS}s "
-                          f"({attempts} scans). Last result: {last_reason}")
-        # Keep cancellation responsive without repeatedly hammering the DOM.
+        last_reason = reason or last_reason
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, f"Target was not found after {timeout:.0f}s ({attempts} scans). Last result: {last_reason}"
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=ELEMENT_RETRY_INTERVAL)
+            await asyncio.wait_for(stop_event.wait(), timeout=min(ELEMENT_RETRY_INTERVAL, remaining))
         except asyncio.TimeoutError:
             pass
     return None, "Replay stopped while waiting for the recorded target: " + last_reason
+
+
+async def wait_gap_and_probe_target(action: dict) -> tuple[bool, str | None]:
+    """Keep observing delayed controls during the recorded inter-action gap.
+
+    The recorded gap is still respected; this only moves detection into that
+    waiting period so a control that appears after an ad delay is not followed
+    by a second, redundant 20-second discovery wait.
+    """
+    try:
+        delay_ms = min(600_000, max(0, int(action.get("gapMs") or 0)))
+    except (TypeError, ValueError, OverflowError):
+        delay_ms = 0
+    if not delay_ms:
+        return not stop_event.is_set(), None
+    add_log(f"Respecting recorded inter-action gap while monitoring target: {delay_ms} ms.",
+            event_type="ACTION_WAIT", status="INFO")
+    deadline = time.monotonic() + delay_ms / 1000
+    first_seen = False
+    scans = 0
+    while not stop_event.is_set():
+        if page is None or page.is_closed():
+            return False, "Browser page closed during recorded gap"
+        if not _action_origin_matches(action):
+            return False, "Page navigated to a different origin during recorded gap"
+        scans += 1
+        locator, _ = await resolve_target(action)
+        if locator is not None and not first_seen:
+            first_seen = True
+            add_log("Next action target appeared during the recorded gap; will revalidate before clicking.",
+                    event_type="ACTION_TARGET_EARLY", status="INFO",
+                    details={"probe_scans": scans, "gap_ms": delay_ms})
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True, None
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=min(GAP_SCAN_INTERVAL, remaining))
+        except asyncio.TimeoutError:
+            pass
+    return False, "Replay stopped during recorded gap"
 
 
 async def execute_action(action: dict, number: int) -> tuple[bool, str]:
@@ -684,12 +746,17 @@ async def run_replay(actions: list[dict]) -> None:
                 add_log(f"Action {number}: {blocked_reason}",
                         "WARN", event_type="ACTION_POLICY", status="BLOCKED")
                 break
-            if not await _wait_recorded_gap(action):
-                result["status"] = "STOPPED"
+            gap_ok, gap_error = await wait_gap_and_probe_target(action)
+            if not gap_ok:
+                result["status"] = "FAILED_ORIGIN_CHANGED" if gap_error and "different origin" in gap_error else "STOPPED"
+                result["error"] = gap_error or "Replay stopped during recorded gap"
+                if result["status"] == "FAILED_ORIGIN_CHANGED":
+                    state["failed"] += 1
+                    state["actions_done"] += 1
+                    add_log(f"Action {number}: {result['error']}.", "WARN",
+                            event_type="ACTION_ORIGIN", status="FAILED")
                 break
-            state["detection_metrics"] = {"attempts": 0, "elapsed_ms": 0, "last_scan_ms": 0}
             locator, last_reason = await wait_for_recorded_target(action)
-            result["detection"] = dict(state["detection_metrics"])
             if stop_event.is_set():
                 result["status"] = "STOPPED"
                 result["error"] = last_reason
@@ -816,9 +883,7 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
         stop_event.clear()
         state.update(status="STARTING",url=req.url,title="",message="Opening website...",
                      actions_total=0,actions_done=0,success=0,verified=0,failed=0,current_action=None,
-                     action_results=[],run_elapsed_ms=0,diagnostics={},
-                     detection_metrics={"attempts":0,"elapsed_ms":0,"last_scan_ms":0},
-                     started_at=time.time(),session_id=str(uuid.uuid4()))
+                     action_results=[],run_elapsed_ms=0,diagnostics={},started_at=time.time(),session_id=str(uuid.uuid4()))
         try:
             await launch_browser(req.url)
         except Exception as exc:
