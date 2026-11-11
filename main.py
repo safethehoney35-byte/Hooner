@@ -22,7 +22,9 @@ from privacy_shield import PrivacyShield
 APP_VERSION = "2.3.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
 MAX_ACTIONS = 5000
-ELEMENT_RETRY_INTERVAL = 0.25  # event-friendly polling; target discovery has no fixed deadline
+ELEMENT_RETRY_INTERVAL = 0.25  # responsive, low-CPU target polling
+ELEMENT_WAIT_TIMEOUT_SECONDS = max(3, min(120, int(os.getenv("NEXUS_ELEMENT_WAIT_SECONDS", "20"))))
+MAX_SELECTOR_CANDIDATES = 250
 LOG_LIMIT = 240
 HOST_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
 
@@ -31,6 +33,7 @@ state: dict[str, Any] = {
     "started_at": None, "actions_total": 0, "actions_done": 0,
     "success": 0, "failed": 0, "current_action": None,
     "diagnostics": {}, "activity": [], "errors": [], "events": [],
+    "detection_metrics": {"attempts": 0, "elapsed_ms": 0, "last_scan_ms": 0},
     "session_id": None, "replay_running": False, "verified": 0,
     "action_results": [], "run_started_at": None, "run_elapsed_ms": 0,
 }
@@ -239,10 +242,8 @@ async def launch_browser(url: str) -> None:
     page.on("response", lambda response: asyncio.create_task(_record_response(response)))
     add_log("Opening requested website.", event_type="PAGE_NAVIGATION", status="RUNNING")
     response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    try: await page.wait_for_load_state("load", timeout=3000)
-    except Exception: add_log("Page load event did not finish within 3 seconds; continuing with live page.",
-                               "WARN", event_type="PAGE_LOADING", status="UNCERTAIN",
-                               details={"wait_timeout_ms": 3000, "navigation_wait_until": "domcontentloaded"})
+    # Avoid waiting for images, fonts and third-party resources after DOM is ready.
+    # Late targets are resolved on demand by wait_for_recorded_target().
     state["title"] = await page.title()
     state["diagnostics"] = await browser_diagnostics()
     add_log(f"Website loaded: {state['title'] or page.url} · HTTP {response.status if response else 'unknown'}",
@@ -343,6 +344,7 @@ def _normal_text(value: Any) -> str:
 async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
     reports = []
     for number, action in enumerate(actions, 1):
+        scan_started = time.monotonic()
         target = adapt_recorder_target(action.get("target") or {})
         selectors = target.get("_nexus_selectors", [])
         candidates, seen = [], set()
@@ -350,7 +352,7 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
             for selector in selectors:
                 try:
                     loc = frame.locator(selector)
-                    count = min(await loc.count(), 100)
+                    count = min(await loc.count(), MAX_SELECTOR_CANDIDATES)
                     for idx in range(count):
                         el = loc.nth(idx)
                         info = await _element_info(el)
@@ -386,6 +388,7 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
                 pass
         reports.append({
             "number": number,
+            "scan_elapsed_ms": round((time.monotonic() - scan_started) * 1000),
             "label": str(target.get("text") or target.get("ariaLabel") or target.get("id") or target.get("tag") or "target")[:100],
             "candidate_count": len(candidates),
             "visible_enabled_count": len(eligible),
@@ -493,7 +496,7 @@ async def resolve_target(action: dict):
         for selector in selectors:
             try:
                 loc = frame.locator(selector)
-                count = min(await loc.count(), 100)
+                count = min(await loc.count(), MAX_SELECTOR_CANDIDATES)
                 for index in range(count):
                     candidate = loc.nth(index)
                     info = await _element_info(candidate)
@@ -542,13 +545,27 @@ async def _wait_recorded_gap(action: dict) -> bool:
 
 async def wait_for_recorded_target(action: dict):
     last_reason = "Target not present yet"
+    attempts = 0
+    started = time.monotonic()
     while not stop_event.is_set():
         if page is None or page.is_closed():
             return None, "Browser page closed while waiting for the recorded target"
+        scan_started = time.monotonic()
         locator, reason = await resolve_target(action)
+        scan_ms = round((time.monotonic() - scan_started) * 1000)
+        attempts += 1
+        last_reason = reason or last_reason
+        state["detection_metrics"] = {
+            "attempts": attempts,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "last_scan_ms": scan_ms,
+        }
         if locator is not None:
             return locator, None
-        last_reason = reason or last_reason
+        if time.monotonic() - started >= ELEMENT_WAIT_TIMEOUT_SECONDS:
+            return None, (f"Target was not found after {ELEMENT_WAIT_TIMEOUT_SECONDS}s "
+                          f"({attempts} scans). Last result: {last_reason}")
+        # Keep cancellation responsive without repeatedly hammering the DOM.
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=ELEMENT_RETRY_INTERVAL)
         except asyncio.TimeoutError:
@@ -670,7 +687,9 @@ async def run_replay(actions: list[dict]) -> None:
             if not await _wait_recorded_gap(action):
                 result["status"] = "STOPPED"
                 break
+            state["detection_metrics"] = {"attempts": 0, "elapsed_ms": 0, "last_scan_ms": 0}
             locator, last_reason = await wait_for_recorded_target(action)
+            result["detection"] = dict(state["detection_metrics"])
             if stop_event.is_set():
                 result["status"] = "STOPPED"
                 result["error"] = last_reason
@@ -797,7 +816,9 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
         stop_event.clear()
         state.update(status="STARTING",url=req.url,title="",message="Opening website...",
                      actions_total=0,actions_done=0,success=0,verified=0,failed=0,current_action=None,
-                     action_results=[],run_elapsed_ms=0,diagnostics={},started_at=time.time(),session_id=str(uuid.uuid4()))
+                     action_results=[],run_elapsed_ms=0,diagnostics={},
+                     detection_metrics={"attempts":0,"elapsed_ms":0,"last_scan_ms":0},
+                     started_at=time.time(),session_id=str(uuid.uuid4()))
         try:
             await launch_browser(req.url)
         except Exception as exc:
