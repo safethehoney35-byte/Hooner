@@ -17,14 +17,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Error as PlaywrightError
-from privacy_shield import PrivacyShield
 
 APP_VERSION = "2.3.0"
 ACCESS_KEY = os.getenv("NEXUS_ACCESS_KEY", "").strip()
 MAX_ACTIONS = 5000
-ELEMENT_RETRY_INTERVAL = 0.25  # event-friendly polling
-ELEMENT_DETECTION_TIMEOUT = 20.0  # bounded wait after the recorded gap
-GAP_SCAN_INTERVAL = 0.50  # look for delayed controls while the recorded gap elapses
+ELEMENT_RETRY_INTERVAL = 0.25  # responsive, low-CPU target polling
+ELEMENT_WAIT_TIMEOUT_SECONDS = max(3, min(120, int(os.getenv("NEXUS_ELEMENT_WAIT_SECONDS", "20"))))
+MAX_SELECTOR_CANDIDATES = 250
 LOG_LIMIT = 240
 HOST_VALIDATION_CACHE: dict[str, tuple[float, bool]] = {}
 
@@ -33,6 +32,7 @@ state: dict[str, Any] = {
     "started_at": None, "actions_total": 0, "actions_done": 0,
     "success": 0, "failed": 0, "current_action": None,
     "diagnostics": {}, "activity": [], "errors": [], "events": [],
+    "detection_metrics": {"attempts": 0, "elapsed_ms": 0, "last_scan_ms": 0},
     "session_id": None, "replay_running": False, "verified": 0,
     "action_results": [], "run_started_at": None, "run_elapsed_ms": 0,
 }
@@ -99,22 +99,20 @@ async def validate_public_url(value: str) -> str:
         raise
 
 
-TRACKER_BLOCKING = os.getenv("NEXUS_BLOCK_TRACKERS", "true").strip().lower() not in {"0", "false", "no", "off"}
-privacy_shield = PrivacyShield(validate_public_url, block_trackers=TRACKER_BLOCKING,
-    extra_tracker_domains={x.strip().lower() for x in os.getenv("NEXUS_EXTRA_TRACKERS", "").split(",") if x.strip()})
-
-
-async def route_guard(route) -> None:
-    allowed, reason = await privacy_shield.inspect(route.request.url, route.request.resource_type)
-    if allowed:
-        await route.continue_()
-    else:
-        safe_url = _safe_diagnostic_url(route.request.url)
-        add_log(f"Privacy Shield blocked {safe_url} ({reason}).",
+async def route_public_url_guard(route) -> None:
+    """Keep SSRF protection for every browser request without tracker blocking."""
+    request_url = route.request.url
+    try:
+        await validate_public_url(request_url)
+    except ValueError as exc:
+        safe_url = _safe_diagnostic_url(request_url)
+        add_log(f"Blocked non-public or invalid network request {safe_url}: {exc}",
                 "WARN", event_type="NETWORK_REQUEST", status="BLOCKED",
                 details={"url": safe_url, "resource_type": route.request.resource_type,
-                         "decision": "BLOCKED", "reason": reason})
+                         "decision": "BLOCKED", "reason": str(exc)})
         await route.abort()
+        return
+    await route.continue_()
 
 
 async def browser_diagnostics() -> dict[str, Any]:
@@ -208,7 +206,6 @@ async def launch_browser(url: str) -> None:
     browser = await asyncio.wait_for(playwright.chromium.launch(headless=True, args=[
         "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote"]), 20)
     context = await browser.new_context(viewport={"width":1280,"height":800}, java_script_enabled=True)
-    await context.route("**/*", route_guard)
     page = await context.new_page()
 
     def on_page_error(exc) -> None:
@@ -241,10 +238,8 @@ async def launch_browser(url: str) -> None:
     page.on("response", lambda response: asyncio.create_task(_record_response(response)))
     add_log("Opening requested website.", event_type="PAGE_NAVIGATION", status="RUNNING")
     response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    try: await page.wait_for_load_state("load", timeout=3000)
-    except Exception: add_log("Page load event did not finish within 3 seconds; continuing with live page.",
-                               "WARN", event_type="PAGE_LOADING", status="UNCERTAIN",
-                               details={"wait_timeout_ms": 3000, "navigation_wait_until": "domcontentloaded"})
+    # Avoid waiting for images, fonts and third-party resources after DOM is ready.
+    # Late targets are resolved on demand by wait_for_recorded_target().
     state["title"] = await page.title()
     state["diagnostics"] = await browser_diagnostics()
     add_log(f"Website loaded: {state['title'] or page.url} · HTTP {response.status if response else 'unknown'}",
@@ -274,31 +269,24 @@ def adapt_recorder_target(raw: dict[str, Any]) -> dict[str, Any]:
     target["name"] = target.get("name") or merged_attrs.get("name")
     target["text"] = target.get("text") or ""
 
-    # Prefer stable semantic identities before recorder-generated CSS paths.
-    # Long nth-of-type paths are fragile when the site's DOM changes.
-    stable_selectors: list[str] = []
-    fallback_selectors: list[str] = []
-    if target.get("id"):
-        stable_selectors.append("#" + str(target["id"]).replace('"', '\\"'))
-    if target.get("testId"):
-        stable_selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\\"') + '"]')
-    if target.get("ariaLabel"):
-        stable_selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\\"') + '"]')
-    if target.get("name"):
-        stable_selectors.append('[name="' + str(target["name"]).replace('"', '\\"') + '"]')
-
+    selectors: list[str] = []
     for source in (target, event_target):
         candidates = source.get("selectorCandidates")
         if isinstance(candidates, list):
-            fallback_selectors.extend(
-                str(x).strip() for x in candidates
-                if isinstance(x, str) and x.strip()
-            )
+            selectors.extend(str(x).strip() for x in candidates if isinstance(x, str) and x.strip())
         for key in ("uniqueSelector", "selector", "cssPath"):
             value = source.get(key)
             if isinstance(value, str) and value.strip():
-                fallback_selectors.append(value.strip())
-    target["_nexus_selectors"] = list(dict.fromkeys(stable_selectors + fallback_selectors))
+                selectors.append(value.strip())
+    if target.get("id"):
+        selectors.append("#" + str(target["id"]).replace('"', '\"'))
+    if target.get("testId"):
+        selectors.append('[data-testid="' + str(target["testId"]).replace('"', '\"') + '"]')
+    if target.get("ariaLabel"):
+        selectors.append('[aria-label="' + str(target["ariaLabel"]).replace('"', '\"') + '"]')
+    if target.get("name"):
+        selectors.append('[name="' + str(target["name"]).replace('"', '\"') + '"]')
+    target["_nexus_selectors"] = list(dict.fromkeys(selectors))
     target["_nexus_attrs"] = merged_attrs
     target["_nexus_identity"] = identity
     return target
@@ -352,6 +340,7 @@ def _normal_text(value: Any) -> str:
 async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
     reports = []
     for number, action in enumerate(actions, 1):
+        scan_started = time.monotonic()
         target = adapt_recorder_target(action.get("target") or {})
         selectors = target.get("_nexus_selectors", [])
         candidates, seen = [], set()
@@ -359,7 +348,7 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
             for selector in selectors:
                 try:
                     loc = frame.locator(selector)
-                    count = min(await loc.count(), 100)
+                    count = min(await loc.count(), MAX_SELECTOR_CANDIDATES)
                     for idx in range(count):
                         el = loc.nth(idx)
                         info = await _element_info(el)
@@ -395,6 +384,7 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
                 pass
         reports.append({
             "number": number,
+            "scan_elapsed_ms": round((time.monotonic() - scan_started) * 1000),
             "label": str(target.get("text") or target.get("ariaLabel") or target.get("id") or target.get("tag") or "target")[:100],
             "candidate_count": len(candidates),
             "visible_enabled_count": len(eligible),
@@ -409,77 +399,85 @@ async def inspect_workflow_targets(actions: list[dict]) -> list[dict]:
 
 
 def fingerprint_matches(el: dict, target: dict) -> bool:
-    attrs = target.get("_nexus_attrs") if isinstance(target.get("_nexus_attrs"), dict) else {}
-    expected_fields = (
-        ("tag", target.get("tag")),
-        ("id", target.get("id") or attrs.get("id")),
-        ("testId", target.get("testId") or attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa")),
-        ("ariaLabel", target.get("ariaLabel") or attrs.get("aria-label")),
-        ("name", target.get("name") or attrs.get("name")),
-        ("role", target.get("role") or attrs.get("role")),
-    )
-    tag_mismatch = False
-    for key, expected in expected_fields:
-        if not expected:
-            continue
-        actual = _normal_text(el.get(key))
-        if actual == _normal_text(expected):
-            continue
-        if key == "tag":
-            tag_mismatch = True
-            continue
-        return False
+    """Tolerant, weighted PEI matching.
 
-    # A site's framework can replace a wrapper tag while preserving its
-    # explicit test id / id / aria-label / name. Trust that strong identity,
-    # but only after it has matched exactly; resolver still enforces uniqueness.
-    strong_identity_matches = any(
-        expected and _normal_text(el.get(key)) == _normal_text(expected)
-        for key, expected in (
-            ("id", target.get("id") or attrs.get("id")),
-            ("testId", target.get("testId") or attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa")),
-            ("ariaLabel", target.get("ariaLabel") or attrs.get("aria-label")),
-            ("name", target.get("name") or attrs.get("name")),
-        )
+    A few independent signals can identify a target; stale classes or changed
+    optional attributes no longer veto an otherwise good match. The minimum
+    score and anchor requirement prevent tag-only/weak matches from clicking.
+    Ambiguous matches are still rejected by resolve_target().
+    """
+    attrs = target.get("_nexus_attrs") if isinstance(target.get("_nexus_attrs"), dict) else {}
+    live_attrs = el.get("attrs") if isinstance(el.get("attrs"), dict) else {}
+    score = 0
+    strong_anchor = False
+
+    # Strong identity signals. Missing or changed values reduce the score,
+    # rather than making the whole fingerprint fail immediately.
+    identity_fields = (
+        ("id", target.get("id") or attrs.get("id"), 10),
+        ("testId", target.get("testId") or attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa"), 10),
+        ("ariaLabel", target.get("ariaLabel") or attrs.get("aria-label"), 8),
+        ("name", target.get("name") or attrs.get("name"), 7),
     )
-    if tag_mismatch and not strong_identity_matches:
-        return False
+    for key, expected, weight in identity_fields:
+        if expected:
+            actual = el.get(key)
+            if actual and _normal_text(actual) == _normal_text(expected):
+                score += weight
+                strong_anchor = True
+
+    expected_tag = _normal_text(target.get("tag"))
+    actual_tag = _normal_text(el.get("tag"))
+    tag_match = bool(expected_tag and actual_tag and expected_tag == actual_tag)
+    if tag_match:
+        score += 2
+
+    expected_role = _normal_text(target.get("role") or attrs.get("role"))
+    actual_role = _normal_text(el.get("role"))
+    if expected_role and actual_role and expected_role == actual_role:
+        score += 3
 
     expected_text = _normal_text(target.get("text"))
     actual_text = _normal_text(el.get("text"))
-    if expected_text and expected_text not in actual_text:
-        # Some pages reuse a stable control (id/test-id/aria-label) while its
-        # visible copy changes between stages, e.g. a generic "skip_next"
-        # control becoming "Skip Ad". Permit that text change only when a
-        # strong recorded identity attribute is present and has already
-        # matched above. Candidate uniqueness is still enforced by resolver.
-        strong_identity = any(
-            expected and _normal_text(el.get(key)) == _normal_text(expected)
-            for key, expected in (
-                ("id", target.get("id") or attrs.get("id")),
-                ("testId", target.get("testId") or attrs.get("data-testid") or attrs.get("data-test") or attrs.get("data-qa")),
-                ("ariaLabel", target.get("ariaLabel") or attrs.get("aria-label")),
-                ("name", target.get("name") or attrs.get("name")),
-            )
-        )
-        if not strong_identity:
-            return False
+    text_match = False
+    if expected_text and actual_text:
+        if expected_text == actual_text:
+            score += 7
+            text_match = True
+        elif len(expected_text) >= 3 and expected_text in actual_text:
+            score += 5
+            text_match = True
+        elif len(actual_text) >= 3 and actual_text in expected_text:
+            score += 3
+            text_match = True
 
-    live_attrs = el.get("attrs") if isinstance(el.get("attrs"), dict) else {}
-    for attr_name in ("type", "role", "placeholder", "title", "alt", "href"):
+    # Optional attributes: matching adds evidence; changed values do not veto
+    # other independent matches (dynamic hrefs/placeholders are common).
+    for attr_name, weight in (("type", 3), ("placeholder", 4), ("title", 3),
+                              ("alt", 3), ("href", 4)):
         expected = attrs.get(attr_name)
         actual = live_attrs.get(attr_name)
-        if expected and actual is not None and _normal_text(expected) != _normal_text(actual):
-            return False
-    expected_class = set(str(attrs.get("class") or "").split())
-    actual_class = set(str(live_attrs.get("class") or "").split())
-    if expected_class and not expected_class.issubset(actual_class):
-        return False
+        if expected and actual and _normal_text(expected) == _normal_text(actual):
+            score += weight
+
+    expected_classes = set(str(attrs.get("class") or "").split())
+    actual_classes = set(str(live_attrs.get("class") or "").split())
+    if expected_classes and actual_classes:
+        score += min(2, len(expected_classes & actual_classes))
+
     expected_data = attrs.get("dataAttributes") if isinstance(attrs.get("dataAttributes"), dict) else {}
+    data_matches = 0
     for key, value in expected_data.items():
-        if live_attrs.get("data-" + str(key).removeprefix("data-")) != value:
-            return False
-    return True
+        actual = live_attrs.get("data-" + str(key).removeprefix("data-"))
+        if actual is not None and _normal_text(actual) == _normal_text(value):
+            data_matches += 1
+    score += min(4, data_matches * 2)
+
+    # Do not accept generic elements based only on a tag/role or one weak
+    # attribute. Require either a strong identity, or text + tag, or several
+    # independent secondary signals.
+    has_anchor = strong_anchor or (text_match and tag_match) or score >= 10
+    return score >= 7 and has_anchor
 
 
 def _context_score(el: dict, target: dict) -> int:
@@ -534,19 +532,13 @@ async def resolve_target(action: dict):
     selectors = target.get("_nexus_selectors", [])
     if not selectors:
         return None, "Recording contains no usable selector or CSS path"
-
     matches = []
     seen = set()
-    frames = list(page.frames)
-
-    # Stable selectors are ordered first by adapt_recorder_target. Resolve
-    # them independently before trying brittle recorder-generated CSS paths.
-    for selector_index, selector in enumerate(selectors):
-        selector_matches = []
-        for frame_index, frame in enumerate(frames):
+    for frame_index, frame in enumerate(list(page.frames)):
+        for selector in selectors:
             try:
                 loc = frame.locator(selector)
-                count = min(await loc.count(), 100)
+                count = min(await loc.count(), MAX_SELECTOR_CANDIDATES)
                 for index in range(count):
                     candidate = loc.nth(index)
                     info = await _element_info(candidate)
@@ -555,23 +547,9 @@ async def resolve_target(action: dict):
                         continue
                     seen.add(key)
                     if info.get("visible") and not info.get("disabled") and fingerprint_matches(info, target):
-                        item = (candidate, _context_score(info, target), frame_index, selector, info)
-                        matches.append(item)
-                        selector_matches.append(item)
+                        matches.append((candidate, _context_score(info, target), frame_index, selector, info))
             except Exception:
                 continue
-
-        # A unique exact match from an explicit id/test-id/aria/name selector
-        # is stronger than a stale CSS path. Avoid scanning every fallback.
-        is_stable_selector = selector.startswith(("#", "[data-testid=", "[aria-label=", "[name="))
-        if is_stable_selector and selector_matches:
-            unique_stable = {}
-            for item in selector_matches:
-                info = item[4]
-                unique_stable[(item[2], info.get("domPath"))] = item
-            if len(unique_stable) == 1:
-                return next(iter(unique_stable.values()))[0], None
-
     if not matches:
         return None, "No visible, enabled element currently matches the recorded PEI identity"
     unique = {}
@@ -607,82 +585,34 @@ async def _wait_recorded_gap(action: dict) -> bool:
         return not stop_event.is_set()
 
 
-def _action_origin_matches(action: dict) -> bool:
-    """Avoid wasting a full detection timeout after the site redirects away."""
-    action_url = action.get("url")
-    if not action_url or page is None or page.is_closed():
-        return True
-    try:
-        expected = urlparse(str(action_url))
-        current = urlparse(page.url)
-        return (expected.scheme in ("http", "https") and
-                expected.netloc.casefold() == current.netloc.casefold())
-    except Exception:
-        return False
-
-
-async def wait_for_recorded_target(action: dict, timeout: float = ELEMENT_DETECTION_TIMEOUT):
+async def wait_for_recorded_target(action: dict):
     last_reason = "Target not present yet"
-    deadline = time.monotonic() + max(0.1, timeout)
     attempts = 0
+    started = time.monotonic()
     while not stop_event.is_set():
         if page is None or page.is_closed():
             return None, "Browser page closed while waiting for the recorded target"
-        if not _action_origin_matches(action):
-            return None, "Page navigated to a different origin before the recorded target appeared"
-        attempts += 1
+        scan_started = time.monotonic()
         locator, reason = await resolve_target(action)
+        scan_ms = round((time.monotonic() - scan_started) * 1000)
+        attempts += 1
+        last_reason = reason or last_reason
+        state["detection_metrics"] = {
+            "attempts": attempts,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "last_scan_ms": scan_ms,
+        }
         if locator is not None:
             return locator, None
-        last_reason = reason or last_reason
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None, f"Target was not found after {timeout:.0f}s ({attempts} scans). Last result: {last_reason}"
+        if time.monotonic() - started >= ELEMENT_WAIT_TIMEOUT_SECONDS:
+            return None, (f"Target was not found after {ELEMENT_WAIT_TIMEOUT_SECONDS}s "
+                          f"({attempts} scans). Last result: {last_reason}")
+        # Keep cancellation responsive without repeatedly hammering the DOM.
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=min(ELEMENT_RETRY_INTERVAL, remaining))
+            await asyncio.wait_for(stop_event.wait(), timeout=ELEMENT_RETRY_INTERVAL)
         except asyncio.TimeoutError:
             pass
     return None, "Replay stopped while waiting for the recorded target: " + last_reason
-
-
-async def wait_gap_and_probe_target(action: dict) -> tuple[bool, str | None]:
-    """Keep observing delayed controls during the recorded inter-action gap.
-
-    The recorded gap is still respected; this only moves detection into that
-    waiting period so a control that appears after an ad delay is not followed
-    by a second, redundant 20-second discovery wait.
-    """
-    try:
-        delay_ms = min(600_000, max(0, int(action.get("gapMs") or 0)))
-    except (TypeError, ValueError, OverflowError):
-        delay_ms = 0
-    if not delay_ms:
-        return not stop_event.is_set(), None
-    add_log(f"Respecting recorded inter-action gap while monitoring target: {delay_ms} ms.",
-            event_type="ACTION_WAIT", status="INFO")
-    deadline = time.monotonic() + delay_ms / 1000
-    first_seen = False
-    scans = 0
-    while not stop_event.is_set():
-        if page is None or page.is_closed():
-            return False, "Browser page closed during recorded gap"
-        if not _action_origin_matches(action):
-            return False, "Page navigated to a different origin during recorded gap"
-        scans += 1
-        locator, _ = await resolve_target(action)
-        if locator is not None and not first_seen:
-            first_seen = True
-            add_log("Next action target appeared during the recorded gap; will revalidate before clicking.",
-                    event_type="ACTION_TARGET_EARLY", status="INFO",
-                    details={"probe_scans": scans, "gap_ms": delay_ms})
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return True, None
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=min(GAP_SCAN_INTERVAL, remaining))
-        except asyncio.TimeoutError:
-            pass
-    return False, "Replay stopped during recorded gap"
 
 
 async def execute_action(action: dict, number: int) -> tuple[bool, str]:
@@ -796,17 +726,12 @@ async def run_replay(actions: list[dict]) -> None:
                 add_log(f"Action {number}: {blocked_reason}",
                         "WARN", event_type="ACTION_POLICY", status="BLOCKED")
                 break
-            gap_ok, gap_error = await wait_gap_and_probe_target(action)
-            if not gap_ok:
-                result["status"] = "FAILED_ORIGIN_CHANGED" if gap_error and "different origin" in gap_error else "STOPPED"
-                result["error"] = gap_error or "Replay stopped during recorded gap"
-                if result["status"] == "FAILED_ORIGIN_CHANGED":
-                    state["failed"] += 1
-                    state["actions_done"] += 1
-                    add_log(f"Action {number}: {result['error']}.", "WARN",
-                            event_type="ACTION_ORIGIN", status="FAILED")
+            if not await _wait_recorded_gap(action):
+                result["status"] = "STOPPED"
                 break
+            state["detection_metrics"] = {"attempts": 0, "elapsed_ms": 0, "last_scan_ms": 0}
             locator, last_reason = await wait_for_recorded_target(action)
+            result["detection"] = dict(state["detection_metrics"])
             if stop_event.is_set():
                 result["status"] = "STOPPED"
                 result["error"] = last_reason
@@ -917,7 +842,7 @@ async def health():
 @app.get("/api/data")
 async def get_data(x_nexus_key: str | None = Header(default=None)):
     require_key(x_nexus_key)
-    return {**state, "privacy_shield":privacy_shield.snapshot()}
+    return state
 
 
 @app.post("/api/start")
@@ -933,7 +858,9 @@ async def start(req: StartRequest, x_nexus_key: str | None = Header(default=None
         stop_event.clear()
         state.update(status="STARTING",url=req.url,title="",message="Opening website...",
                      actions_total=0,actions_done=0,success=0,verified=0,failed=0,current_action=None,
-                     action_results=[],run_elapsed_ms=0,diagnostics={},started_at=time.time(),session_id=str(uuid.uuid4()))
+                     action_results=[],run_elapsed_ms=0,diagnostics={},
+                     detection_metrics={"attempts":0,"elapsed_ms":0,"last_scan_ms":0},
+                     started_at=time.time(),session_id=str(uuid.uuid4()))
         try:
             await launch_browser(req.url)
         except Exception as exc:
